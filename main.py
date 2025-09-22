@@ -13,6 +13,7 @@ def main(identifier,price_a,price_b,symbol,type):
 
 
 td_email = 'alerts@'
-em.start_email_listener(td_email,callback = main,poll_interval=3,listen_duration=300)
+em.start_email_listener(td_email,callback = main,poll_interval=3)
 
     
+
