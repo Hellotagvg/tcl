@@ -1,3 +1,4 @@
+
 import os
 import json
 import time
@@ -7,10 +8,10 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
-def start_email_listener(sender_email, callback, poll_interval=3, listen_duration=300):
+def start_email_listener(sender_email, callback, poll_interval=3):
     """
-    Listens for Gmail messages from a specific sender for a fixed duration (in seconds)
-    and runs `callback(i, f1, f2, s1, s2)` for each {{int,float,float,str,str}} block.
+    Listens for Gmail messages from a specific sender and runs `callback(i, f1, f2, s1, s2)`
+    for each {{int,float,float,str,str}} block.
     """
     # ==== Locate credentials.json dynamically ====
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -38,7 +39,7 @@ def start_email_listener(sender_email, callback, poll_interval=3, listen_duratio
         creds_data["access_token"] = creds.token
         with open(creds_path, "w") as f:
             json.dump({"installed": creds_data}, f, indent=4)
-        print("Token refreshed ✅")
+        print("Token refreshed ���")
 
     # Build Gmail API service
     service = build("gmail", "v1", credentials=creds)
@@ -65,11 +66,10 @@ def start_email_listener(sender_email, callback, poll_interval=3, listen_duratio
                 continue
         return results
 
-    print(f"Starting Gmail listener for {sender_email} for {listen_duration} seconds (polling every {poll_interval}s)...")
+    print(f"Starting Gmail listener for {sender_email} (polling every {poll_interval}s)...")
 
-    start_time = time.time()
-    # ==== Poll Gmail for the duration specified ====
-    while time.time() - start_time < listen_duration:
+    # ==== Poll Gmail forever ====
+    while True:
         try:
             results = service.users().messages().list(
                 userId="me",
@@ -114,19 +114,15 @@ def start_email_listener(sender_email, callback, poll_interval=3, listen_duratio
                     for i, f1, f2, s1, s2 in values:
                         callback(i, f1, f2, s1, s2)
                 else:
-                    print("No matching {{…}} text found in the email.")
+                    print("No matching {{���}} text found in the email.")
 
         except Exception as e:
             print("Error fetching emails:", e)
 
         time.sleep(poll_interval)
 
-    print("Finished listening ✅")
-
 # ===== Example usage =====
 if __name__ == "__main__":
     def main(i, f1, f2, s1, s2):
         print(f"int={i}, float1={f1}, float2={f2}, str1='{s1}', str2='{s2}'")
-
-    # Listen for 5 minutes (300 seconds)
-    start_email_listener(sender_email="specific.sender@example.com", callback=main, listen_duration=300)
+No file chosenNo file chosen
