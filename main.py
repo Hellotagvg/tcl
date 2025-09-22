@@ -5,7 +5,7 @@ import pybybit as pb
 def main(identifier,price_a,price_b,symbol,type):
     max_wait = int()
     key_dict = {
-    "acc1": {"api_key": "API1", "api_secret": "SECRET1"},
+    "acc1": {"api_key": "OAO6GrRXfCTOnrSAtF", "Ct8vw1yVfQi1zEGRI67JKqxhoK5cKG1Xg2Pp": "SECRET1"},
     "acc2": {"api_key": "API2", "api_secret": "SECRET2"}
         } 
     dict_a,dict_b = c.tcl_calc(price_a,price_b,symbol,type)
@@ -14,4 +14,5 @@ def main(identifier,price_a,price_b,symbol,type):
 
 td_email = 'alerts@'
 em.start_email_listener(td_email,callback = main,poll_interval=3,listen_duration=300)
+
     
