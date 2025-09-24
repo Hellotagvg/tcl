@@ -4,7 +4,7 @@ from functools import wraps
 import gspread
 from google.oauth2.service_account import Credentials
 
-acc_size = float('20000')
+acc_size = float('10000')
 
 # ========================
 # Robust credentials loading
@@ -113,14 +113,10 @@ def tcl_calc(price1: float, price2: float, symbol: str, type: str):
 
     # Position sizing
     position_size = (qty1 * L1) + (qty2 * L2) + (qty3 * L3)
-    leverage_input = round(acc_size / position_size * 1.1)
+    leverage_input = round(position_size * 1.1/ acc_size)
     write(sheet, "C9", leverage_input)
+    
 
-    while margin_status != "Yes":
-        print("Please enter a new leverage")
-        leverage_input = int(input("Enter Leverage: "))
-        write(sheet, "C9", leverage_input)
-        margin_status = str(read(sheet, "D9"))
 
     print("Leverage accepted")
 
