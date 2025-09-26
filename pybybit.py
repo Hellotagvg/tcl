@@ -4,7 +4,7 @@ import uuid
 import queue
 from pybit.unified_trading import HTTP
 
-# ---------- Rate-limited REST requests ----------
+# ---------- Rate-limited REST requests (simple per-account 1req/sec) ----------
 last_request_time = {}
 def rate_limited_request(account_name, func, *args, **kwargs):
     now = time.time()
@@ -17,6 +17,11 @@ def rate_limited_request(account_name, func, *args, **kwargs):
 
 # ---------- Helper to fetch open orders (tries multiple method names) ----------
 def fetch_open_orders_safe(session, symbol):
+    """
+    Try several common pybit method names to obtain open/active orders.
+    Returns a list (possibly empty) of order dicts.
+    Raises exception if none of the method calls work (bubbles last exception).
+    """
     candidates = [
         "get_open_orders",
         "query_active_order",
@@ -25,6 +30,7 @@ def fetch_open_orders_safe(session, symbol):
         "get_order_list",
         "get_open_order",
         "get_orders",
+        "get_order_history",
     ]
     last_exc = None
     for name in candidates:
@@ -33,6 +39,7 @@ def fetch_open_orders_safe(session, symbol):
             continue
         try:
             resp = fn(category="linear", symbol=symbol)
+            # Normalize common response shapes
             if isinstance(resp, dict):
                 result = resp.get("result")
                 if isinstance(result, dict):
@@ -53,23 +60,40 @@ def fetch_open_orders_safe(session, symbol):
 
 # ---------- Main function ----------
 def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300):
-    results = {}
-    sessions = {}
+    """
+    keys_dict: {"acc1": {"api_key": "...", "api_secret": "..."}, ...}
+    order_dict: {"coin":"BTCUSDT","side":"Buy","leverage":..,"qty1":..,"limit1":..,...}
+    tpsl_dict: {"symbol":"BTCUSDT","tp1":..,"sl1":..,...}
+    demo: True -> use Bybit Demo environment (pass demo=demo to HTTP)
+    """
+
+    # State containers
+    results = {}   # per-account placed orders list of {"orderLinkId":...}
+    sessions = {}  # per-account HTTP session
     final_summary = {acc: {"filled": [], "canceled": [], "timeout": False, "done": False, "user_cancel": False}
                      for acc in keys_dict.keys()}
     order_timestamps = {}
     cancel_requested = {"flag": False}
     stop_event = threading.Event()
 
-    # per-account mapping: orderLinkId -> limit number
+    # per-account mapping orderLinkId -> limit number
     orderlinkid_to_limit = {acc: {} for acc in keys_dict.keys()}
-    # per-account pending orderLinkIds set
     pending_orderlinks = {acc: set() for acc in keys_dict.keys()}
+
+    # processed markers to avoid duplicate handling
+    processed_fills = {acc: set() for acc in keys_dict.keys()}
+
+    # flag indicating account currently has a monitored active position (TP/SL set)
+    active_position_flag = {acc: False for acc in keys_dict.keys()}
+
+    # lock for modifying shared structures safely
+    lock = threading.Lock()
 
     fill_events = queue.Queue()
 
     # ---------- Place Orders ----------
     def place_orders(account_name, creds):
+        print(f"[DEBUG] [{account_name}] Initializing HTTP session...")
         session = HTTP(api_key=creds["api_key"], api_secret=creds["api_secret"], demo=demo)
         sessions[account_name] = session
 
@@ -97,15 +121,16 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                                             price=str(order_dict[f"limit{i}"]),
                                             timeInForce="GTC",
                                             orderLinkId=order_link_id)
-                results[account_name].append({"orderLinkId": order_link_id})
-                orderlinkid_to_limit[account_name][order_link_id] = i
-                pending_orderlinks[account_name].add(order_link_id)
+                with lock:
+                    results[account_name].append({"orderLinkId": order_link_id})
+                    orderlinkid_to_limit[account_name][order_link_id] = i
+                    pending_orderlinks[account_name].add(order_link_id)
                 print(f"[{account_name}] 📌 Limit{i} placed (orderLinkId={order_link_id}) @ {order_dict[f'limit{i}']}")
             except Exception as e:
                 print(f"[{account_name}] ⚠️ Error placing Limit{i}: {e}")
             time.sleep(1)
 
-    # place orders for all accounts in parallel
+    # run placement for all accounts in parallel
     threads = []
     for acc, creds in keys_dict.items():
         t = threading.Thread(target=place_orders, args=(acc, creds), daemon=True)
@@ -116,7 +141,7 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
 
     print("[DEBUG] ✅ All accounts placed orders.")
 
-    # ---------- TPSL Worker ----------
+    # ---------- TPSL Worker: sets TP/SL when a tracked orderLinkId fills ----------
     def tpsl_worker():
         while not stop_event.is_set():
             try:
@@ -126,6 +151,11 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
 
             if stop_event.is_set():
                 break
+
+            with lock:
+                if order_link_id in processed_fills[account_name]:
+                    continue
+                processed_fills[account_name].add(order_link_id)
 
             limit_num = orderlinkid_to_limit.get(account_name, {}).get(order_link_id)
             if limit_num is None:
@@ -138,25 +168,6 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                 print(f"[{account_name}] ⚠️ Missing TP/SL for limit {limit_num}")
                 continue
 
-            # wait for position to be visible
-            start_time = time.time()
-            position_filled = False
-            while not stop_event.is_set() and time.time() - start_time < 15:
-                try:
-                    pos_resp = rate_limited_request(account_name, sessions[account_name].get_positions,
-                                                    category="linear", symbol=tpsl_dict["symbol"])
-                    positions = pos_resp.get("result", {}).get("list", [])
-                    if positions and float(positions[0].get("size", 0)) > 0:
-                        position_filled = True
-                        break
-                except Exception as e:
-                    print(f"[{account_name}] ⚠️ Error checking position: {e}")
-                time.sleep(0.5)
-
-            if not position_filled:
-                print(f"[{account_name}] ⚠️ Position not found in time for {order_link_id}. Skipping TP/SL for limit {limit_num}")
-                continue
-
             # set trading stop (TP/SL)
             try:
                 rate_limited_request(account_name, sessions[account_name].set_trading_stop,
@@ -165,35 +176,23 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                                      takeProfit=str(tp),
                                      stopLoss=str(sl),
                                      positionIdx=0)
-                final_summary[account_name]["filled"].append(f"Limit{limit_num}")
-                print(f"[{account_name}] ✅ Limit{limit_num} filled → TP/SL set.")
+                with lock:
+                    final_summary[account_name]["filled"].append(f"Limit{limit_num}")
+                    # mark that this account now has an active monitored position
+                    active_position_flag[account_name] = True
+                print(f"[{account_name}] ✅ Limit{limit_num} filled → TP/SL set (tp={tp} sl={sl}).")
+                # Start a position monitor thread for this account if not already running
+                # (only one monitor per account)
+                monitor_name = f"pos_monitor_{account_name}"
+                # start monitor thread (daemon) — will be idempotent by checking active_position_flag
+                t = threading.Thread(target=position_monitor, args=(account_name,), daemon=True)
+                t.start()
             except Exception as e:
                 print(f"[{account_name}] ⚠️ Error setting TP/SL for Limit{limit_num}: {e}")
-                continue
 
-            # **New behavior**: once TP/SL is set for this filled order, cancel remaining pending limit orders for this account
-            try:
-                cancel_fn = getattr(sessions[account_name], "cancel_order", None) or getattr(sessions[account_name], "cancel_active_order", None)
-                for other_link in list(pending_orderlinks[account_name]):
-                    if other_link == order_link_id:
-                        continue
-                    try:
-                        if callable(cancel_fn):
-                            rate_limited_request(account_name, cancel_fn,
-                                                 category="linear", symbol=tpsl_dict["symbol"], orderLinkId=other_link)
-                            final_summary[account_name]["canceled"].append(other_link)
-                            print(f"[{account_name}] ❌ Cancelled other order {other_link} after TP/SL set.")
-                    except Exception as e:
-                        print(f"[{account_name}] ⚠️ Error cancelling {other_link}: {e}")
-                # clear pending set (we consider the others handled)
-                pending_orderlinks[account_name].clear()
-            except Exception as e:
-                print(f"[{account_name}] ⚠️ Error during post-TP cancel flow: {e}")
+    # position_monitor defined below; reference before definition via closure
 
-    t_tpsl = threading.Thread(target=tpsl_worker, daemon=True)
-    t_tpsl.start()
-
-    # ---------- Polling Worker (quiet - no per-second prints) ----------
+    # ---------- Polling Worker: detect fills by orderLinkId (quiet) ----------
     def polling_worker():
         processed = {acc: set() for acc in keys_dict.keys()}
 
@@ -201,19 +200,18 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
             for acc in keys_dict.keys():
                 if stop_event.is_set():
                     break
-
                 session = sessions.get(acc)
                 if session is None:
                     continue
 
-                # skip if no pending orders
+                # skip if no pending orders for this account
                 if not pending_orderlinks[acc]:
                     continue
 
                 try:
                     try:
                         orders = fetch_open_orders_safe(session, tpsl_dict["symbol"])
-                    except Exception as e:
+                    except Exception:
                         orders = []
 
                     found_links = set()
@@ -227,14 +225,16 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                         if order_link not in orderlinkid_to_limit.get(acc, {}):
                             continue
 
-                        # if filled, enqueue TPSL if not already processed
+                        # If filled, enqueue TPSL handling (only once)
                         if str(status).lower() in ("filled", "complete", "closed"):
                             if order_link not in processed[acc]:
                                 processed[acc].add(order_link)
-                                pending_orderlinks[acc].discard(order_link)
+                                with lock:
+                                    pending_orderlinks[acc].discard(order_link)
                                 fill_events.put((acc, order_link))
+                                print(f"[DEBUG] [{acc}] Order {order_link} detected as filled (status={status}).")
 
-                    # Fallback: if a tracked orderLinkId isn't present in open-orders, check order history
+                    # Fallback: orders might disappear from open-orders when filled.
                     missing = set(pending_orderlinks[acc]) - found_links
                     if missing:
                         for missing_link in list(missing):
@@ -258,9 +258,10 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                                     for rec in hist:
                                         status = rec.get("orderStatus") or rec.get("status")
                                         if str(status).lower() in ("filled", "complete", "closed"):
-                                            processed[acc].add(missing_link)
-                                            pending_orderlinks[acc].discard(missing_link)
+                                            with lock:
+                                                pending_orderlinks[acc].discard(missing_link)
                                             fill_events.put((acc, missing_link))
+                                            print(f"[DEBUG] [{acc}] (history) Order {missing_link} detected as filled (status={status}).")
                                             break
                                 else:
                                     pass
@@ -270,14 +271,85 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                 except Exception as e:
                     print(f"[{acc}] ⚠️ Error polling orders: {e}")
 
-            # sleep in short increments so stop_event is responsive
+            # responsive sleep (breakable by stop_event)
             for _ in range(10):
                 if stop_event.is_set():
                     break
                 time.sleep(0.1)
 
+    # ---------- Position monitor: waits until position closes, then cancels remaining limits ----------
+    def position_monitor(account_name):
+        """
+        Wait until a position appears (size>0) then wait until it is closed (size==0).
+        Once closed, cancel any remaining pending limit orders for the account.
+        """
+        # avoid starting multiple monitors simultaneously
+        # This function can be started multiple times but proceeds only if active_position_flag True
+        waited_for_position = False
+        while not stop_event.is_set():
+            if not active_position_flag.get(account_name):
+                # nothing to monitor yet
+                time.sleep(0.5)
+                continue
+
+            # poll positions for this account
+            try:
+                pos_resp = rate_limited_request(account_name, sessions[account_name].get_positions,
+                                                category="linear", symbol=tpsl_dict["symbol"])
+                positions = pos_resp.get("result", {}).get("list", [])
+                size = 0.0
+                if positions:
+                    try:
+                        size = float(positions[0].get("size", 0))
+                    except Exception:
+                        size = 0.0
+                if not waited_for_position:
+                    if size > 0:
+                        waited_for_position = True
+                        print(f"[{account_name}] 🔎 Position detected (size={size}). Now monitoring for close (TP/SL).")
+                else:
+                    # we had a position; check whether it closed
+                    if size == 0:
+                        print(f"[{account_name}] ✅ Position closed (TP/SL hit or manual close). Cancelling remaining limit orders...")
+                        # cancel remaining pending orders
+                        try:
+                            cancel_fn = getattr(sessions[account_name], "cancel_order", None) or getattr(sessions[account_name], "cancel_active_order", None)
+                            with lock:
+                                to_cancel = list(pending_orderlinks[account_name])
+                            for link in to_cancel:
+                                try:
+                                    if callable(cancel_fn):
+                                        rate_limited_request(account_name, cancel_fn,
+                                                             category="linear", symbol=tpsl_dict["symbol"], orderLinkId=link)
+                                        with lock:
+                                            final_summary[account_name]["canceled"].append(link)
+                                            pending_orderlinks[account_name].discard(link)
+                                        print(f"[{account_name}] ❌ Cancelled leftover order {link} after position closed.")
+                                except Exception as e:
+                                    print(f"[{account_name}] ⚠️ Error cancelling {link}: {e}")
+                        except Exception as e:
+                            print(f"[{account_name}] ⚠️ Error during cancel-after-close: {e}")
+
+                        # mark that account no longer has active monitored position
+                        with lock:
+                            active_position_flag[account_name] = False
+                        # done monitoring for this position; break out to allow normal flow
+                        return
+                # loop delay
+            except Exception as e:
+                print(f"[{account_name}] ⚠️ Error fetching positions: {e}")
+            # responsive sleep
+            for _ in range(5):
+                if stop_event.is_set():
+                    break
+                time.sleep(0.2)
+
+    # Start background threads
     t_poll = threading.Thread(target=polling_worker, daemon=True)
     t_poll.start()
+
+    t_tpsl = threading.Thread(target=tpsl_worker, daemon=True)
+    t_tpsl.start()
 
     # ---------- User cancel listener ----------
     def listen_for_cancel():
@@ -285,6 +357,7 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
             user_input = input().strip().lower()
             if user_input == "cancel":
                 cancel_requested["flag"] = True
+                print("[DEBUG] Cancel requested by user.")
                 break
 
     t_listen = threading.Thread(target=listen_for_cancel, daemon=True)
@@ -301,10 +374,13 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                     continue
 
                 if cancel_requested["flag"]:
+                    # perform immediate cancel+close flow and stop everything
                     print(f"[{acc}] ⛔ User requested cancel. Cancelling outstanding orders and closing positions...")
                     try:
                         cancel_fn = getattr(sessions[acc], "cancel_order", None) or getattr(sessions[acc], "cancel_active_order", None)
-                        for o in list(results.get(acc, [])):
+                        with lock:
+                            to_cancel = list(results.get(acc, []))
+                        for o in to_cancel:
                             olnk = o.get("orderLinkId")
                             if not olnk:
                                 continue
@@ -312,9 +388,11 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                                 try:
                                     rate_limited_request(acc, cancel_fn,
                                                          category="linear", symbol=tpsl_dict["symbol"], orderLinkId=olnk)
-                                    final_summary[acc]["canceled"].append(olnk)
+                                    with lock:
+                                        final_summary[acc]["canceled"].append(olnk)
                                 except Exception as e:
                                     print(f"[{acc}] ⚠️ Error cancelling {olnk}: {e}")
+                        # close positions
                         pos_info = rate_limited_request(acc, sessions[acc].get_positions,
                                                         category="linear", symbol=tpsl_dict["symbol"])
                         for p in pos_info.get("result", {}).get("list", []):
@@ -337,12 +415,14 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                     stop_event.set()
                     continue
 
-                # timeout handling per account
+                # timeout handling
                 if order_timestamps.get(acc) and now - order_timestamps[acc] > max_wait_seconds:
                     print(f"[{acc}] ⏳ Timeout reached, cancelling remaining orders.")
                     try:
                         cancel_fn = getattr(sessions[acc], "cancel_order", None) or getattr(sessions[acc], "cancel_active_order", None)
-                        for o in list(results.get(acc, [])):
+                        with lock:
+                            to_cancel = list(results.get(acc, []))
+                        for o in to_cancel:
                             olnk = o.get("orderLinkId")
                             if not olnk:
                                 continue
@@ -350,7 +430,8 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                                 try:
                                     rate_limited_request(acc, cancel_fn,
                                                          category="linear", symbol=tpsl_dict["symbol"], orderLinkId=olnk)
-                                    final_summary[acc]["canceled"].append(olnk)
+                                    with lock:
+                                        final_summary[acc]["canceled"].append(olnk)
                                 except Exception as e:
                                     print(f"[{acc}] ⚠️ Error cancelling {olnk}: {e}")
                     except Exception as e:
@@ -359,11 +440,11 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                     final_summary[acc]["done"] = True
                     continue
 
-                # if any pending orderlinks remain, we're not done
-                if pending_orderlinks[acc]:
+                # if there are pending orders or active position, we are not done yet
+                if pending_orderlinks[acc] or active_position_flag[acc]:
                     all_done = False
                 else:
-                    # if no pending and we've recorded fills/cancels, mark done
+                    # nothing pending and no active position => done
                     final_summary[acc]["done"] = True
 
             if all_done:
@@ -377,9 +458,10 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                 time.sleep(0.1)
 
     except KeyboardInterrupt:
+        print("[DEBUG] KeyboardInterrupt received, stopping.")
         stop_event.set()
 
-    # wait a short moment for threads to finish
+    # wait briefly for threads to exit
     t_poll.join(timeout=2)
     t_tpsl.join(timeout=2)
     t_listen.join(timeout=0.1)
