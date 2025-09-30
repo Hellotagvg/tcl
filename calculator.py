@@ -142,13 +142,33 @@ def tcl_calc(price1: float, price2: float, symbol: str, type: str):
             "l3": SL,
             "symbol": symbol
         }
-    else:
+    if type == 'tcl2':
         tpsl_dict = {
             "tp1": TP1,
             "sl1": SL,
             "tp2": TP1,
             "sl2": SL,
             "tp3": tp3,
+            "l3": SL,
+            "symbol": symbol
+        }
+    if type == 'tcl3':
+        tpsl_dict = {
+            "tp1": TP1,
+            "sl1": SL,
+            "tp2": TP1,
+            "sl2": SL,
+            "tp3": tp2,
+            "l3": SL,
+            "symbol": symbol
+        }
+    if type == 'tcl4':
+        tpsl_dict = {
+            "tp1": TP1,
+            "sl1": SL,
+            "tp2": TP1,
+            "sl2": SL,
+            "tp3": tp2,
             "l3": SL,
             "symbol": symbol
         }
