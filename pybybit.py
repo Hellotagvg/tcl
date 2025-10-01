@@ -9,7 +9,7 @@ from pybit.unified_trading import HTTP
 
 # ---------------------- CONFIG ----------------------
 # Receive window in milliseconds (10 minutes = 600000)
-RECV_WINDOW_MS = 600000
+RECV_WINDOW_MS = 600000000
 
 # ---------- Bybit server-time patch helper ----------
 
@@ -565,3 +565,4 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
     print("[DEBUG] Exiting trade_tcl, summary:")
     print(final_summary)
     return final_summary
+
