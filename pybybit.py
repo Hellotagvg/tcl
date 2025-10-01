@@ -8,25 +8,26 @@ import queue
 from pybit.unified_trading import HTTP
 
 
+
 # ---------- Rate-limited REST requests (simple per-account 1req/sec) ----------
 
 last_request_time = {}
 
 def rate_limited_request(account_name, func, *args, **kwargs):
 
-    now = time.time()
+    now = time.time()
 
-    if account_name in last_request_time:
+    if account_name in last_request_time:
 
-        elapsed = now - last_request_time[account_name]
+        elapsed = now - last_request_time[account_name]
 
-        if elapsed < 1:
+        if elapsed < 1:
 
-            time.sleep(1 - elapsed)
+            time.sleep(1 - elapsed)
 
-    last_request_time[account_name] = time.time()
+    last_request_time[account_name] = time.time()
 
-    return func(*args, **kwargs)
+    return func(*args, **kwargs)
 
 
 
@@ -34,85 +35,85 @@ def rate_limited_request(account_name, func, *args, **kwargs):
 
 def fetch_open_orders_safe(session, symbol):
 
-    """
+    """
 
-    Try several common pybit method names to obtain open/active orders.
+    Try several common pybit method names to obtain open/active orders.
 
-    Returns a list (possibly empty) of order dicts.
+    Returns a list (possibly empty) of order dicts.
 
-    Raises exception if none of the method calls work (bubbles last exception).
+    Raises exception if none of the method calls work (bubbles last exception).
 
-    """
+    """
 
-    candidates = [
+    candidates = [
 
-        "get_open_orders",
+        "get_open_orders",
 
-        "query_active_order",
+        "query_active_order",
 
-        "get_active_order",
+        "get_active_order",
 
-        "query_order",
+        "query_order",
 
-        "get_order_list",
+        "get_order_list",
 
-        "get_open_order",
+        "get_open_order",
 
-        "get_orders",
+        "get_orders",
 
-        "get_order_history",
+        "get_order_history",
 
-    ]
+    ]
 
-    last_exc = None
+    last_exc = None
 
-    for name in candidates:
+    for name in candidates:
 
-        fn = getattr(session, name, None)
+        fn = getattr(session, name, None)
 
-        if not callable(fn):
+        if not callable(fn):
 
-            continue
+            continue
 
-        try:
+        try:
 
-            resp = fn(category="linear", symbol=symbol)
+            resp = fn(category="linear", symbol=symbol)
 
-            # Normalize common response shapes
+            # Normalize common response shapes
 
-            if isinstance(resp, dict):
+            if isinstance(resp, dict):
 
-                result = resp.get("result")
+                result = resp.get("result")
 
-                if isinstance(result, dict):
+                if isinstance(result, dict):
 
-                    if "list" in result and isinstance(result["list"], list):
+                    if "list" in result and isinstance(result["list"], list):
 
-                        return result["list"]
+                        return result["list"]
 
-                    if "data" in result and isinstance(result["data"], list):
+                    if "data" in result and isinstance(result["data"], list):
 
-                        return result["data"]
+                        return result["data"]
 
-                if isinstance(result, list):
+                if isinstance(result, list):
 
-                    return result
+                    return result
 
-            if isinstance(resp, list):
+            if isinstance(resp, list):
 
-                return resp
+                return resp
 
-        except Exception as e:
+        except Exception as e:
 
-            last_exc = e
+            last_exc = e
 
-            continue
+            continue
 
-    if last_exc:
+    if last_exc:
 
-        raise last_exc
+        raise last_exc
 
-    raise AttributeError("No supported open-order fetch method found on session")
+    raise AttributeError("No supported open-order fetch method found on session")
 
 
 
@@ -120,690 +121,820 @@ def fetch_open_orders_safe(session, symbol):
 
 def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300):
 
-    """
+    """
 
-    keys_dict: {"acc1": {"api_key": "...", "api_secret": "..."}, ...}
+    keys_dict: {"acc1": {"api_key": "...", "api_secret": "..."}, ...}
 
-    order_dict: {"coin":"BTCUSDT","side":"Buy","leverage":..,"qty1":..,"limit1":..,...}
+    order_dict: {"coin":"BTCUSDT","side":"Buy","leverage":..,"qty1":..,"limit1":..,...}
 
-    tpsl_dict: {"symbol":"BTCUSDT","tp1":..,"sl1":..,...}
+    tpsl_dict: {"symbol":"BTCUSDT","tp1":..,"sl1":..,...}
 
-    demo: True -> use Bybit Demo environment (pass demo=demo to HTTP)
+    demo: True -> use Bybit Demo environment (pass demo=demo to HTTP)
 
-    """
+    """
 
 
 
-    # State containers
+    # State containers
 
-    results = {}   # per-account placed orders list of {"orderLinkId":...}
+    results = {}   # per-account placed orders list of {"orderLinkId":...}
 
-    sessions = {}  # per-account HTTP session
+    sessions = {}  # per-account HTTP session
 
-    final_summary = {acc: {"filled": [], "canceled": [], "timeout": False, "done": False, "user_cancel": False}
+    final_summary = {acc: {"filled": [], "canceled": [], "timeout": False, "done": False, "user_cancel": False}
 
-                     for acc in keys_dict.keys()}
+                     for acc in keys_dict.keys()}
 
-    order_timestamps = {}
+    order_timestamps = {}
 
-    cancel_requested = {"flag": False}
+    cancel_requested = {"flag": False}
 
-    stop_event = threading.Event()
+    stop_event = threading.Event()
 
 
 
-    # per-account mapping orderLinkId -> limit number
+    # per-account mapping orderLinkId -> limit number
 
-    orderlinkid_to_limit = {acc: {} for acc in keys_dict.keys()}
+    orderlinkid_to_limit = {acc: {} for acc in keys_dict.keys()}
 
-    pending_orderlinks = {acc: set() for acc in keys_dict.keys()}
+    pending_orderlinks = {acc: set() for acc in keys_dict.keys()}
 
 
 
-    # processed markers to avoid duplicate handling
+    # processed markers to avoid duplicate handling
 
-    processed_fills = {acc: set() for acc in keys_dict.keys()}
+    processed_fills = {acc: set() for acc in keys_dict.keys()}
 
 
 
-    # flag indicating account currently has a monitored active position (TP/SL set)
+    # flag indicating account currently has a monitored active position (TP/SL set)
 
-    active_position_flag = {acc: False for acc in keys_dict.keys()}
+    active_position_flag = {acc: False for acc in keys_dict.keys()}
 
 
 
-    # lock for modifying shared structures safely
+    # lock for modifying shared structures safely
 
-    lock = threading.Lock()
+    lock = threading.Lock()
 
 
 
-    fill_events = queue.Queue()
+    fill_events = queue.Queue()
 
 
 
-    # ---------- Place Orders ----------
+    # ---------- Place Orders ----------
 
-    def place_orders(account_name, creds):
+    def place_orders(account_name, creds):
 
-        print(f"[DEBUG] [{account_name}] Initializing HTTP session...")
+        print(f"[DEBUG] [{account_name}] Initializing HTTP session...")
 
-        session = HTTP(api_key=creds["api_key"], api_secret=creds["api_secret"], demo=demo, recv_window=600000)
+        session = HTTP(api_key=creds["api_key"], api_secret=creds["api_secret"], demo=demo)
 
-        sessions[account_name] = session
+        sessions[account_name] = session
 
 
 
-        try:
+        try:
 
-            rate_limited_request(account_name, session.set_leverage,
+            rate_limited_request(account_name, session.set_leverage,
 
-                                 category="linear",
+                                 category="linear",
 
-                                 symbol=order_dict["coin"],
+                                 symbol=order_dict["coin"],
 
-                                 buyLeverage=str(order_dict["leverage"]),
+                                 buyLeverage=str(order_dict["leverage"]),
 
-                                 sellLeverage=str(order_dict["leverage"]))
+                                 sellLeverage=str(order_dict["leverage"]))
 
-        except Exception as e:
+        except Exception as e:
 
-            print(f"[{account_name}] ⚠️ Error setting leverage: {e}")
+            print(f"[{account_name}] ⚠️ Error setting leverage: {e}")
 
 
 
-        results[account_name] = []
+        results[account_name] = []
 
-        order_timestamps[account_name] = time.time()
+        order_timestamps[account_name] = time.time()
 
 
 
-        for i in range(1, 4):
+        for i in range(1, 4):
 
-            order_link_id = f"{account_name}_limit{i}_{uuid.uuid4().hex[:8]}"
+            order_link_id = f"{account_name}_limit{i}_{uuid.uuid4().hex[:8]}"
 
-            try:
+            try:
 
-                resp = rate_limited_request(account_name, session.place_order,
+                resp = rate_limited_request(account_name, session.place_order,
 
-                                            category="linear",
+                                            category="linear",
 
-                                            symbol=order_dict["coin"],
+                                            symbol=order_dict["coin"],
 
-                                            side=order_dict["side"],
+                                            side=order_dict["side"],
 
-                                            orderType="Limit",
+                                            orderType="Limit",
 
-                                            qty=str(order_dict[f"qty{i}"]),
+                                            qty=str(order_dict[f"qty{i}"]),
 
-                                            price=str(order_dict[f"limit{i}"]),
+                                            price=str(order_dict[f"limit{i}"]),
 
-                                            timeInForce="GTC",
+                                            timeInForce="GTC",
 
-                                            orderLinkId=order_link_id)
+                                            orderLinkId=order_link_id)
 
-                with lock:
+                with lock:
 
-                    results[account_name].append({"orderLinkId": order_link_id})
+                    results[account_name].append({"orderLinkId": order_link_id})
 
-                    orderlinkid_to_limit[account_name][order_link_id] = i
+                    orderlinkid_to_limit[account_name][order_link_id] = i
 
-                    pending_orderlinks[account_name].add(order_link_id)
+                    pending_orderlinks[account_name].add(order_link_id)
 
-                print(f"[{account_name}] 📌 Limit{i} placed (orderLinkId={order_link_id}) @ {order_dict[f'limit{i}']}")
+                print(f"[{account_name}] 📌 Limit{i} placed (orderLinkId={order_link_id}) @ {order_dict[f'limit{i}']}")
 
-            except Exception as e:
+            except Exception as e:
 
-                print(f"[{account_name}] ⚠️ Error placing Limit{i}: {e}")
+                print(f"[{account_name}] ⚠️ Error placing Limit{i}: {e}")
 
-            time.sleep(1)
+            time.sleep(1)
 
 
 
-    # run placement for all accounts in parallel
+    # run placement for all accounts in parallel
 
-    threads = []
+    threads = []
 
-    for acc, creds in keys_dict.items():
+    for acc, creds in keys_dict.items():
 
-        t = threading.Thread(target=place_orders, args=(acc, creds), daemon=True)
+        t = threading.Thread(target=place_orders, args=(acc, creds), daemon=True)
 
-        threads.append(t)
+        threads.append(t)
 
-        t.start()
+        t.start()
 
-    for t in threads:
+    for t in threads:
 
-        t.join()
+        t.join()
 
 
 
-    print("[DEBUG] ✅ All accounts placed orders.")
+    print("[DEBUG] ✅ All accounts placed orders.")
 
 
 
-    # ---------- TPSL Worker: sets TP/SL when a tracked orderLinkId fills ----------
+    # ---------- TPSL Worker: sets TP/SL when a tracked orderLinkId fills ----------
 
-    def tpsl_worker():
+    def tpsl_worker():
 
-        while not stop_event.is_set():
+        while not stop_event.is_set():
 
-            try:
+            try:
 
-                account_name, order_link_id = fill_events.get(timeout=1)
+                account_name, order_link_id = fill_events.get(timeout=1)
 
-            except queue.Empty:
+            except queue.Empty:
 
-                continue
+                continue
 
 
 
-            if stop_event.is_set():
+            if stop_event.is_set():
 
-                break
+                break
 
 
 
-            with lock:
+            with lock:
 
-                if order_link_id in processed_fills[account_name]:
+                if order_link_id in processed_fills[account_name]:
 
-                    continue
+                    continue
 
-                processed_fills[account_name].add(order_link_id)
+                processed_fills[account_name].add(order_link_id)
 
 
 
-            limit_num = orderlinkid_to_limit.get(account_name, {}).get(order_link_id)
+            limit_num = orderlinkid_to_limit.get(account_name, {}).get(order_link_id)
 
-            if limit_num is None:
+            if limit_num is None:
 
-                print(f"[{account_name}] ⚠️ Unknown orderLinkId {order_link_id} in TPSL worker")
+                print(f"[{account_name}] ⚠️ Unknown orderLinkId {order_link_id} in TPSL worker")
 
-                continue
+                continue
 
 
 
-            tp = tpsl_dict.get(f"tp{limit_num}")
+            tp = tpsl_dict.get(f"tp{limit_num}")
 
-            sl = tpsl_dict.get(f"sl{limit_num}")
+            sl = tpsl_dict.get(f"sl{limit_num}")
 
-            if tp is None or sl is None:
+            if tp is None or sl is None:
 
-                print(f"[{account_name}] ⚠️ Missing TP/SL for limit {limit_num}")
+                print(f"[{account_name}] ⚠️ Missing TP/SL for limit {limit_num}")
 
-                continue
+                continue
 
 
 
-            # set trading stop (TP/SL)
+            # set trading stop (TP/SL)
 
-            try:
+            try:
 
-                rate_limited_request(account_name, sessions[account_name].set_trading_stop,
+                rate_limited_request(account_name, sessions[account_name].set_trading_stop,
 
-                                     category="linear",
+                                     category="linear",
 
-                                     symbol=tpsl_dict["symbol"],
+                                     symbol=tpsl_dict["symbol"],
 
-                                     takeProfit=str(tp),
+                                     takeProfit=str(tp),
 
-                                     stopLoss=str(sl),
+                                     stopLoss=str(sl),
 
-                                     positionIdx=0)
+                                     positionIdx=0)
 
-                with lock:
+                with lock:
 
-                    final_summary[account_name]["filled"].append(f"Limit{limit_num}")
+                    final_summary[account_name]["filled"].append(f"Limit{limit_num}")
 
-                    # mark that this account now has an active monitored position
+                    # mark that this account now has an active monitored position
 
-                    active_position_flag[account_name] = True
+                    active_position_flag[account_name] = True
 
-                print(f"[{account_name}] ✅ Limit{limit_num} filled → TP/SL set (tp={tp} sl={sl}).")
+                print(f"[{account_name}] ✅ Limit{limit_num} filled → TP/SL set (tp={tp} sl={sl}).")
 
-                # Start a position monitor thread for this account if not already running
+                # Start a position monitor thread for this account if not already running
 
-                # (only one monitor per account)
+                # (only one monitor per account)
 
-                # start monitor thread (daemon) — will be idempotent by checking active_position_flag
+                monitor_name = f"pos_monitor_{account_name}"
 
-                t = threading.Thread(target=position_monitor, args=(account_name,), daemon=True)
+                # start monitor thread (daemon) — will be idempotent by checking active_position_flag
 
-                t.start()
+                t = threading.Thread(target=position_monitor, args=(account_name,), daemon=True)
 
-            except Exception as e:
+                t.start()
 
-                print(f"[{account_name}] ⚠️ Error setting TP/SL for Limit{limit_num}: {e}")
+            except Exception as e:
 
+                print(f"[{account_name}] ⚠️ Error setting TP/SL for Limit{limit_num}: {e}")
 
 
-    # position_monitor defined below; reference before definition via closure
 
+    # position_monitor defined below; reference before definition via closure
 
 
-    # ---------- Polling Worker: detect fills by orderLinkId (quiet) ----------
 
-    def polling_worker():
+    # ---------- Polling Worker: detect fills by orderLinkId (quiet) ----------
 
-        processed = {acc: set() for acc in keys_dict.keys()}
+    def polling_worker():
 
+        processed = {acc: set() for acc in keys_dict.keys()}
 
 
-        while not stop_event.is_set():
 
-            for acc in keys_dict.keys():
+        while not stop_event.is_set():
 
-                if stop_event.is_set():
+            for acc in keys_dict.keys():
 
-                    break
+                if stop_event.is_set():
 
-                session = sessions.get(acc)
+                    break
 
-                if session is None:
+                session = sessions.get(acc)
 
-                    continue
+                if session is None:
 
+                    continue
 
 
-                # skip if no pending orders for this account
 
-                if not pending_orderlinks[acc]:
+                # skip if no pending orders for this account
 
-                    continue
+                if not pending_orderlinks[acc]:
 
+                    continue
 
 
-                try:
 
-                    try:
+                try:
 
-                        orders = fetch_open_orders_safe(session, tpsl_dict["symbol"])
+                    try:
 
-                    except Exception:
+                        orders = fetch_open_orders_safe(session, tpsl_dict["symbol"])
 
-                        orders = []
+                    except Exception:
 
+                        orders = []
 
 
-                    found_links = set()
 
-                    for order in orders:
+                    found_links = set()
 
-                        order_link = order.get("orderLinkId")
+                    for order in orders:
 
-                        status = order.get("orderStatus") or order.get("status") or order.get("order_status")
+                        order_link = order.get("orderLinkId")
 
-                        if not order_link:
+                        status = order.get("orderStatus") or order.get("status") or order.get("order_status")
 
-                            continue
+                        if not order_link:
 
-                        found_links.add(order_link)
+                            continue
 
+                        found_links.add(order_link)
 
 
-                        if order_link not in orderlinkid_to_limit.get(acc, {}):
 
-                            continue
+                        if order_link not in orderlinkid_to_limit.get(acc, {}):
 
+                            continue
 
 
-                        # If filled, enqueue TPSL handling (only once)
 
-                        if str(status).lower() in ("filled", "complete", "closed"):
+                        # If filled, enqueue TPSL handling (only once)
 
-                            if order_link not in processed[acc]:
+                        if str(status).lower() in ("filled", "complete", "closed"):
 
-                                processed[acc].add(order_link)
+                            if order_link not in processed[acc]:
 
-                                with lock:
+                                processed[acc].add(order_link)
 
-                                    pending_orderlinks[acc].discard(order_link)
+                                with lock:
 
-                                fill_events.put((acc, order_link))
+                                    pending_orderlinks[acc].discard(order_link)
 
-                                print(f"[DEBUG] [{acc}] Order {order_link} detected as filled (status={status}).")
+                                fill_events.put((acc, order_link))
 
+                                print(f"[DEBUG] [{acc}] Order {order_link} detected as filled (status={status}).")
 
 
-                    # Fallback: orders might disappear from open-orders when filled.
 
-                    missing = set(pending_orderlinks[acc]) - found_links
+                    # Fallback: orders might disappear from open-orders when filled.
 
-                    if missing:
+                    missing = set(pending_orderlinks[acc]) - found_links
 
-                        for missing_link in list(missing):
+                    if missing:
 
-                            if stop_event.is_set():
+                        for missing_link in list(missing):
 
-                                break
+                            if stop_event.is_set():
 
-                            try:
+                                break
 
-                                history_fn = getattr(session, "get_order_history", None) or getattr(session, "query_order", None) or getattr(session, "query_active_order", None) or getattr(session, "get_orders", None)
+                            try:
 
-                                if callable(history_fn):
+                                history_fn = getattr(session, "get_order_history", None) or getattr(session, "query_order", None) or getattr(session, "query_active_order", None) or getattr(session, "get_orders", None)
 
-                                    resp = rate_limited_request(acc, history_fn,
+                                if callable(history_fn):
 
-                                                                category="linear",
+                                    resp = rate_limited_request(acc, history_fn,
 
-                                                                symbol=tpsl_dict["symbol"],
+                                                                category="linear",
 
-                                                                orderLinkId=missing_link,
+                                                                symbol=tpsl_dict["symbol"],
 
-                                                                limit=20)
+                                                                orderLinkId=missing_link,
 
-                                    hist = []
+                                                                limit=20)
 
-                                    if isinstance(resp, dict):
+                                    hist = []
 
-                                        res = resp.get("result")
+                                    if isinstance(resp, dict):
 
-                                        if isinstance(res, dict):
+                                        res = resp.get("result")
 
-                                            hist = res.get("list") or res.get("data") or []
+                                        if isinstance(res, dict):
 
-                                        elif isinstance(res, list):
+                                            hist = res.get("list") or res.get("data") or []
 
-                                            hist = res
+                                        elif isinstance(res, list):
 
-                                    for rec in hist:
+                                            hist = res
 
-                                        status = rec.get("orderStatus") or rec.get("status")
+                                    for rec in hist:
 
-                                        if str(status).lower() in ("filled", "complete", "closed"):
+                                        status = rec.get("orderStatus") or rec.get("status")
 
-                                            with lock:
+                                        if str(status).lower() in ("filled", "complete", "closed"):
 
-                                                pending_orderlinks[acc].discard(missing_link)
+                                            with lock:
 
-                                            fill_events.put((acc, missing_link))
+                                                pending_orderlinks[acc].discard(missing_link)
 
-                                            print(f"[DEBUG] [{acc}] (history) Order {missing_link} detected as filled (status={status}).")
+                                            fill_events.put((acc, missing_link))
 
-                                            break
+                                            print(f"[DEBUG] [{acc}] (history) Order {missing_link} detected as filled (status={status}).")
 
-                                else:
+                                            break
 
-                                    pass
+                                else:
 
-                            except Exception as e:
+                                    pass
 
-                                print(f"[{acc}] ⚠️ Error checking history for {missing_link}: {e}")
+                            except Exception as e:
 
+                                print(f"[{acc}] ⚠️ Error checking history for {missing_link}: {e}")
 
 
-                except Exception as e:
 
-                    print(f"[{acc}] ⚠️ Error polling orders: {e}")
+                except Exception as e:
 
+                    print(f"[{acc}] ⚠️ Error polling orders: {e}")
 
 
-            # responsive sleep (breakable by stop_event)
 
-            for _ in range(10):
+            # responsive sleep (breakable by stop_event)
 
-                if stop_event.is_set():
+            for _ in range(10):
 
-                    break
+                if stop_event.is_set():
 
-                time.sleep(0.1)
+                    break
 
+                time.sleep(0.1)
 
 
-    # ---------- Position monitor: waits until position closes, then cancels remaining limits ----------
 
-    def position_monitor(account_name):
+    # ---------- Position monitor: waits until position closes, then cancels remaining limits ----------
 
-        """
+    def position_monitor(account_name):
 
-        Wait until a position appears (size>0) then wait until it is closed (size==0).
+        """
 
-        Once closed, cancel any remaining pending limit orders for the account.
+        Wait until a position appears (size>0) then wait until it is closed (size==0).
 
-        """
+        Once closed, cancel any remaining pending limit orders for the account.
 
-        # avoid starting multiple monitors simultaneously
+        """
 
-        # This function can be started multiple times but proceeds only if active_position_flag True
+        # avoid starting multiple monitors simultaneously
 
-        waited_for_position = False
+        # This function can be started multiple times but proceeds only if active_position_flag True
 
-        while not stop_event.is_set():
+        waited_for_position = False
 
-            if not active_position_flag.get(account_name):
+        while not stop_event.is_set():
 
-                # nothing to monitor yet
+            if not active_position_flag.get(account_name):
 
-                time.sleep(0.5)
+                # nothing to monitor yet
 
-                continue
+                time.sleep(0.5)
 
+                continue
 
 
-            # poll positions for this account
 
-            try:
+            # poll positions for this account
 
-                pos_resp = rate_limited_request(account_name, sessions[account_name].get_positions,
+            try:
 
-                                                category="linear", symbol=tpsl_dict["symbol"])
+                pos_resp = rate_limited_request(account_name, sessions[account_name].get_positions,
 
-                positions = pos_resp.get("result", {}).get("list", [])
+                                                category="linear", symbol=tpsl_dict["symbol"])
 
-                size = 0.0
+                positions = pos_resp.get("result", {}).get("list", [])
 
-                if positions:
+                size = 0.0
 
-                    try:
+                if positions:
 
-                        size = float(positions[0].get("size", 0))
+                    try:
 
-                    except Exception:
+                        size = float(positions[0].get("size", 0))
 
-                        size = 0.0
+                    except Exception:
 
-                if not waited_for_position:
+                        size = 0.0
 
-                    if size > 0:
+                if not waited_for_position:
 
-                        waited_for_position = True
+                    if size > 0:
 
-                        print(f"[{account_name}] 🔎 Position detected (size={size}). Now monitoring for close (TP/SL).")
+                        waited_for_position = True
 
-                else:
+                        print(f"[{account_name}] 🔎 Position detected (size={size}). Now monitoring for close (TP/SL).")
 
-                    # we had a position; check whether it closed
+                else:
 
-                    if size == 0:
+                    # we had a position; check whether it closed
 
-                        print(f"[{account_name}] ✅ Position closed (TP/SL hit or manual close). Cancelling remaining limit orders...")
+                    if size == 0:
 
-                        # cancel remaining pending orders
+                        print(f"[{account_name}] ✅ Position closed (TP/SL hit or manual close). Cancelling remaining limit orders...")
 
-                        try:
+                        # cancel remaining pending orders
 
-                            cancel_fn = getattr(sessions[account_name], "cancel_order", None) or getattr(sessions[account_name], "cancel_active_order", None)
+                        try:
 
-                            with lock:
+                            cancel_fn = getattr(sessions[account_name], "cancel_order", None) or getattr(sessions[account_name], "cancel_active_order", None)
 
-                                to_cancel = list(pending_orderlinks[account_name])
+                            with lock:
 
-                            for link in to_cancel:
+                                to_cancel = list(pending_orderlinks[account_name])
 
-                                try:
+                            for link in to_cancel:
 
-                                    if callable(cancel_fn):
+                                try:
 
-                                        rate_limited_request(account_name, cancel_fn,
+                                    if callable(cancel_fn):
 
-                                                             category="linear", symbol=tpsl_dict["symbol"], orderLinkId=link)
+                                        rate_limited_request(account_name, cancel_fn,
 
-                                        with lock:
+                                                             category="linear", symbol=tpsl_dict["symbol"], orderLinkId=link)
 
-                                            final_summary[account_name]["canceled"].append(link)
+                                        with lock:
 
-                                            pending_orderlinks[account_name].discard(link)
+                                            final_summary[account_name]["canceled"].append(link)
 
-                                        print(f"[{account_name}] ❌ Cancelled leftover order {link} after position closed.")
+                                            pending_orderlinks[account_name].discard(link)
 
-                                except Exception as e:
+                                        print(f"[{account_name}] ❌ Cancelled leftover order {link} after position closed.")
 
-                                    print(f"[{account_name}] ⚠️ Error cancelling {link}: {e}")
+                                except Exception as e:
 
-                        except Exception as e:
+                                    print(f"[{account_name}] ⚠️ Error cancelling {link}: {e}")
 
-                            print(f"[{account_name}] ⚠️ Error during cancel-after-close: {e}")
+                        except Exception as e:
 
+                            print(f"[{account_name}] ⚠️ Error during cancel-after-close: {e}")
 
 
-                        # mark that account no longer has active monitored position
 
-                        with lock:
+                        # mark that account no longer has active monitored position
 
-                            active_position_flag[account_name] = False
+                        with lock:
 
-                        # done monitoring for this position; break out to allow normal flow
+                            active_position_flag[account_name] = False
 
-                        return
+                        # done monitoring for this position; break out to allow normal flow
 
-                # loop delay
+                        return
 
-            except Exception as e:
+                # loop delay
 
-                print(f"[{account_name}] ⚠️ Error fetching positions: {e}")
+            except Exception as e:
 
-            # responsive sleep
+                print(f"[{account_name}] ⚠️ Error fetching positions: {e}")
 
-            for _ in range(5):
+            # responsive sleep
 
-                if stop_event.is_set():
+            for _ in range(5):
 
-                    break
+                if stop_event.is_set():
 
-                time.sleep(0.2)
+                    break
 
+                time.sleep(0.2)
 
 
-    # Start background threads
 
-    t_poll = threading.Thread(target=polling_worker, daemon=True)
+    # Start background threads
 
-    t_poll.start()
+    t_poll = threading.Thread(target=polling_worker, daemon=True)
 
+    t_poll.start()
 
 
-    t_tpsl = threading.Thread(target=tpsl_worker, daemon=True)
 
-    t_tpsl.start()
+    t_tpsl = threading.Thread(target=tpsl_worker, daemon=True)
 
+    t_tpsl.start()
 
 
-    # ---------- User cancel listener ----------
 
-    def listen_for_cancel():
+    # ---------- User cancel listener ----------
 
-        while True:
+    def listen_for_cancel():
 
-            user_input = input().strip().lower()
+        while True:
 
-            if user_input == "cancel":
+            user_input = input().strip().lower()
 
-                cancel_requested["flag"] = True
+            if user_input == "cancel":
 
-                print("[DEBUG] Cancel requested by user.")
+                cancel_requested["flag"] = True
 
-                break
+                print("[DEBUG] Cancel requested by user.")
 
+                break
 
 
-    t_listen = threading.Thread(target=listen_for_cancel, daemon=True)
 
-    t_listen.start()
+    t_listen = threading.Thread(target=listen_for_cancel, daemon=True)
 
+    t_listen.start()
 
 
-    # ---------- Monitor orders, cancel/timeouts ----------
 
-    try:
+    # ---------- Monitor orders, cancel/timeouts ----------
 
-        while True:
+    try:
 
-            all_done = True
+        while True:
 
-            now = time.time()
+            all_done = True
 
+            now = time.time()
 
 
-            for acc in keys_dict.keys():
 
-                if final_summary[acc]["done"]:
+            for acc in keys_dict.keys():
 
-                    continue
+                if final_summary[acc]["done"]:
 
+                    continue
 
 
-                if cancel_requested["flag"]:
 
-                    # perform immediate cancel+close flow and stop everything
+                if cancel_requested["flag"]:
 
-                    print(f"[{acc}] ⛔ User requested cancel. Cancelling outstanding orders and closing positions...")
+                    # perform immediate cancel+close flow and stop everything
 
-                    try:
+                    print(f"[{acc}] ⛔ User requested cancel. Cancelling outstanding orders and closing positions...")
 
-                        cancel_fn = getattr(sessions[acc], "cancel_order", None) or getattr(sessions[acc], "cancel_active_order", None)
+                    try:
 
-                        with lock:
+                        cancel_fn = getattr(sessions[acc], "cancel_order", None) or getattr(sessions[acc], "cancel_active_order", None)
 
-                            to_cancel = list(results.get(acc, []))
+                        with lock:
 
-                        for o in to_cancel:
+                            to_cancel = list(results.get(acc, []))
 
-                            olnk = o.get("orderLinkId")
+                        for o in to_cancel:
 
-                            if not olnk:
+                            olnk = o.get("orderLinkId")
 
-                                continue
+                            if not olnk:
 
-                            if callable(cancel_fn):
+                                continue
 
-                                try:
+                            if callable(cancel_fn):
 
-                                    rate_limited_request(acc, cancel_fn,
+                                try:
 
-                                                         category="linear", symbol=tpsl_dict["symbol"], orderLinkId=olnk)
+                                    rate_limited_request(acc, cancel_fn,
 
-                                    with lock:
+                                                         category="linear", symbol=tpsl_dict["symbol"], orderLinkId=olnk)
 
-                                        final_summary[acc]["canceled"].append(olnk)
+                                    with lock:
 
-                                except Exception as e:
+                                        final_summary[acc]["canceled"].append(olnk)
 
-                                    print(f"[{acc}] ⚠️ Error cancelling {olnk}: {e}")
+                                except Exception as e:
 
-                        # close positions
+                                    print(f"[{acc}] ⚠️ Error cancelling {olnk}: {e}")
 
-                        pos_info = rate_limited_request(acc, sessions[acc].get_positions,
+                        # close positions
 
-                                                        category="linear", symbol=tpsl_dict["symbol"])
+                        pos_info = rate_limited_request(acc, sessions[acc].get_positions,
 
-                        for p in pos_info.get("result", {}).get("list", []):
+                                                        category="linear", symbol=tpsl_dict["symbol"])
 
-                            size = float(p.get("size", 0))
+                        for p in pos_info.get("result", {}).get("list", []):
 
-                            side = p.get("side")
+                            size = float(p.get("size", 0))
 
-                            if size > 0:
+                            side = p.get("side")
 
-                                close_side = "Sell" if side == "Buy" else "Buy"
+                            if size > 0:
 
-                                rate_limited_request(acc, sessions[acc].place_order,
+                                close_side = "Sell" if side == "Buy" else "Buy"
 
-                                                     category="linear",
+                                rate_limited_request(acc, sessions[acc].place_order,
 
-                                                     symbol=tpsl_dict["symbol"],
+                                                     category="linear",
 
-                                                     side=close_side,
+                                                     symbol=tpsl_dict["symbol"],
 
-{"pattern":"session = HTTP(api_key=creds["api_key"], api_secret=creds["api_secret"], demo=demo, recv_window=600000)
+                                                     side=close_side,
+
+                                                     orderType="Market",
+
+                                                     qty=str(size),
+
+                                                     reduceOnly=True)
+
+                                print(f"[{acc}] 🛑 Closed {size} {side} position.")
+
+                    except Exception as e:
+
+                        print(f"[{acc}] ⚠️ Error during cancel sequence: {e}")
+
+                    final_summary[acc]["user_cancel"] = True
+
+                    final_summary[acc]["done"] = True
+
+                    stop_event.set()
+
+                    continue
+
+
+
+                # timeout handling
+
+                if order_timestamps.get(acc) and now - order_timestamps[acc] > max_wait_seconds:
+
+                    print(f"[{acc}] ⏳ Timeout reached, cancelling remaining orders.")
+
+                    try:
+
+                        cancel_fn = getattr(sessions[acc], "cancel_order", None) or getattr(sessions[acc], "cancel_active_order", None)
+
+                        with lock:
+
+                            to_cancel = list(results.get(acc, []))
+
+                        for o in to_cancel:
+
+                            olnk = o.get("orderLinkId")
+
+                            if not olnk:
+
+                                continue
+
+                            if callable(cancel_fn):
+
+                                try:
+
+                                    rate_limited_request(acc, cancel_fn,
+
+                                                         category="linear", symbol=tpsl_dict["symbol"], orderLinkId=olnk)
+
+                                    with lock:
+
+                                        final_summary[acc]["canceled"].append(olnk)
+
+                                except Exception as e:
+
+                                    print(f"[{acc}] ⚠️ Error cancelling {olnk}: {e}")
+
+                    except Exception as e:
+
+                        print(f"[{acc}] ⚠️ Error during timeout cancel: {e}")
+
+                    final_summary[acc]["timeout"] = True
+
+                    final_summary[acc]["done"] = True
+
+                    continue
+
+
+
+                # if there are pending orders or active position, we are not done yet
+
+                if pending_orderlinks[acc] or active_position_flag[acc]:
+
+                    all_done = False
+
+                else:
+
+                    # nothing pending and no active position => done
+
+                    final_summary[acc]["done"] = True
+
+
+
+            if all_done:
+
+                stop_event.set()
+
+                break
+
+
+
+            # responsive sleep
+
+            for _ in range(10):
+
+                if stop_event.is_set():
+
+                    break
+
+                time.sleep(0.1)
+
+
+
+    except KeyboardInterrupt:
+
+        print("[DEBUG] KeyboardInterrupt received, stopping.")
+
+        stop_event.set()
+
+
+
+    # wait briefly for threads to exit
+
+    t_poll.join(timeout=2)
+
+    t_tpsl.join(timeout=2)
+
+    t_listen.join(timeout=0.1)
+
+
+
+    print("[DEBUG] Exiting trade_tcl, summary:")
+
+    print(final_summary)
+
+    return final_summary
