@@ -139,7 +139,7 @@ def tcl_calc(price1: float, price2: float, symbol: str, type: str):
             "tp2": tp2,
             "sl2": SL,
             "tp3": tp3,
-            "l3": SL,
+            "sl3": SL,
             "symbol": symbol
         }
     if type == 'tcl2':
@@ -149,7 +149,7 @@ def tcl_calc(price1: float, price2: float, symbol: str, type: str):
             "tp2": TP1,
             "sl2": SL,
             "tp3": tp3,
-            "l3": SL,
+            "sl3": SL,
             "symbol": symbol
         }
     if type == 'tcl3':
@@ -159,7 +159,7 @@ def tcl_calc(price1: float, price2: float, symbol: str, type: str):
             "tp2": TP1,
             "sl2": SL,
             "tp3": tp2,
-            "l3": SL,
+            "sl3": SL,
             "symbol": symbol
         }
     if type == 'tcl4':
@@ -168,8 +168,8 @@ def tcl_calc(price1: float, price2: float, symbol: str, type: str):
             "sl1": SL,
             "tp2": TP1,
             "sl2": SL,
-            "tp3": tp2,
-            "l3": SL,
+            "tp3": TP1,
+            "sl3": SL,
             "symbol": symbol
         }
 
