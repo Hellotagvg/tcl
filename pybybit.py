@@ -1,9 +1,13 @@
+#!/usr/bin/env python3
 import threading
 import time
 import uuid
 import queue
 import requests
 import contextlib
+import hmac
+import hashlib
+import json
 
 from pybit.unified_trading import HTTP
 
@@ -12,7 +16,6 @@ from pybit.unified_trading import HTTP
 RECV_WINDOW_MS = 600000
 
 # ---------- Bybit server-time helper & patch ----------
-
 def _fetch_bybit_server_time_ms(demo=True, timeout=5):
     """Try several Bybit time endpoints and return server_time_ms or None."""
     candidates = []
@@ -52,7 +55,7 @@ def _fetch_bybit_server_time_ms(demo=True, timeout=5):
 
 @contextlib.contextmanager
 def use_bybit_server_time_patch(demo=True, verbose=True):
-    """Patch time.time() and time.time_ns() so pybit signatures use Bybit server time.
+    """Patch time.time() and time.time_ns() so signatures use Bybit server time.
 
     Yields True if patched; False if fetch failed (no patch applied).
     Restores originals on exit.
@@ -108,7 +111,6 @@ def rate_limited_request(account_name, func, *args, **kwargs):
 
 
 # ---------- Helper to fetch open orders (tries multiple method names) ----------
-
 def fetch_open_orders_safe(session, symbol):
     """
     Try several common pybit method names to obtain open/active orders.
@@ -155,8 +157,66 @@ def fetch_open_orders_safe(session, symbol):
     raise AttributeError("No supported open-order fetch method found on session")
 
 
-# ---------- Main function ----------
+# ---------- Signed POST helper (v5) ----------
+def _make_signature(api_key, api_secret, recv_window, timestamp_ms, body_json):
+    """Bybit v5 sign: HMAC_SHA256(secret, timestamp + apiKey + recvWindow + body_json)"""
+    payload = f"{timestamp_ms}{api_key}{recv_window}{body_json}"
+    return hmac.new(api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
+
+def signed_post(base_url, api_key, api_secret, path, body, recv_window_ms=RECV_WINDOW_MS, timeout=10):
+    """
+    Send signed POST to Bybit v5.
+    body: Python dict -> will be JSON-serialized with separators=(',', ':') (no spaces).
+    Returns parsed JSON response.
+    """
+    timestamp = str(int(time.time() * 1000))
+    body_json = json.dumps(body, separators=(",", ":"))
+    sign = _make_signature(api_key, api_secret, str(recv_window_ms), timestamp, body_json)
+
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-SIGN-TYPE": "2",
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": str(recv_window_ms),
+        "Content-Type": "application/json",
+    }
+
+    url = base_url.rstrip("/") + path
+    resp = requests.post(url, headers=headers, data=body_json, timeout=timeout)
+    try:
+        return resp.json()
+    except ValueError:
+        return {"http_status": resp.status_code, "text": resp.text}
+
+
+# Action wrappers (per-account)
+def make_account_actions(api_key, api_secret, demo=True, recv_window_ms=RECV_WINDOW_MS):
+    base = "https://api-demo.bybit.com" if demo else "https://api.bybit.com"
+
+    def place_order(body):
+        return signed_post(base, api_key, api_secret, "/v5/order/create", body, recv_window_ms)
+
+    def cancel_order(body):
+        return signed_post(base, api_key, api_secret, "/v5/order/cancel", body, recv_window_ms)
+
+    def set_trading_stop(body):
+        return signed_post(base, api_key, api_secret, "/v5/position/trading-stop", body, recv_window_ms)
+
+    def set_leverage(body):
+        return signed_post(base, api_key, api_secret, "/v5/position/set-leverage", body, recv_window_ms)
+
+    return {
+        "place_order": place_order,
+        "cancel_order": cancel_order,
+        "set_trading_stop": set_trading_stop,
+        "set_leverage": set_leverage,
+        "base_url": base,
+    }
+
+
+# ---------- Main function ----------
 def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300):
     """
     keys_dict: {"acc1": {"api_key": "...", "api_secret": "..."}, ...}
@@ -181,7 +241,8 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
     with use_bybit_server_time_patch(demo=demo):
         # State containers
         results = {}   # per-account placed orders list of {"orderLinkId":...}
-        sessions = {}  # per-account HTTP session
+        sessions = {}  # per-account HTTP (pybit) session
+        actions = {}   # per-account manual POST actions (place/cancel/set)
         final_summary = {acc: {"filled": [], "canceled": [], "timeout": False, "done": False, "user_cancel": False}
                          for acc in keys_dict.keys()}
         order_timestamps = {}
@@ -206,20 +267,26 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
         # ---------- Place Orders ----------
         def place_orders(account_name, creds):
             print(f"[DEBUG] [{account_name}] Initializing HTTP session (recv_window={RECV_WINDOW_MS})...")
+            # keep pybit session for GETs
             try:
                 session = HTTP(api_key=creds["api_key"], api_secret=creds["api_secret"], demo=demo, recv_window=RECV_WINDOW_MS)
             except TypeError:
                 session = HTTP(api_key=creds["api_key"], api_secret=creds["api_secret"], testnet=demo, recv_window=RECV_WINDOW_MS)
             sessions[account_name] = session
+            # create manual action wrappers bound to this account
+            actions[account_name] = make_account_actions(creds["api_key"], creds["api_secret"], demo=demo, recv_window_ms=RECV_WINDOW_MS)
 
+            # set leverage via signed manual POST (pybit's POST had issues)
             try:
-                rate_limited_request(account_name, session.set_leverage,
-                                     category="linear",
-                                     symbol=order_dict["coin"],
-                                     buyLeverage=str(order_dict["leverage"]),
-                                     sellLeverage=str(order_dict["leverage"]))
+                lev_body = {
+                    "category": "linear",
+                    "symbol": order_dict["coin"],
+                    "buyLeverage": str(order_dict["leverage"]),
+                    "sellLeverage": str(order_dict["leverage"])
+                }
+                rate_limited_request(account_name, actions[account_name]["set_leverage"], lev_body)
             except Exception as e:
-                print(f"[{account_name}] ⚠️ Error setting leverage: {e}")
+                print(f"[{account_name}] ⚠️ Error setting leverage (manual): {e}")
 
             results[account_name] = []
             order_timestamps[account_name] = time.time()
@@ -227,22 +294,28 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
             for i in range(1, 4):
                 order_link_id = f"{account_name}_limit{i}_{uuid.uuid4().hex[:8]}"
                 try:
-                    resp = rate_limited_request(account_name, session.place_order,
-                                                category="linear",
-                                                symbol=order_dict["coin"],
-                                                side=order_dict["side"],
-                                                orderType="Limit",
-                                                qty=str(order_dict[f"qty{i}"]),
-                                                price=str(order_dict[f"limit{i}"]),
-                                                timeInForce="GTC",
-                                                orderLinkId=order_link_id)
-                    with lock:
-                        results[account_name].append({"orderLinkId": order_link_id})
-                        orderlinkid_to_limit[account_name][order_link_id] = i
-                        pending_orderlinks[account_name].add(order_link_id)
-                    print(f"[{account_name}] 📌 Limit{i} placed (orderLinkId={order_link_id}) @ {order_dict[f'limit{i}']}")
+                    body = {
+                        "category": "linear",
+                        "symbol": order_dict["coin"],
+                        "side": order_dict["side"],
+                        "orderType": "Limit",
+                        "qty": str(order_dict[f"qty{i}"]),
+                        "price": str(order_dict[f"limit{i}"]),
+                        "timeInForce": "GTC",
+                        "orderLinkId": order_link_id
+                    }
+                    resp = rate_limited_request(account_name, actions[account_name]["place_order"], body)
+                    # check success
+                    if isinstance(resp, dict) and resp.get("retCode") == 0:
+                        with lock:
+                            results[account_name].append({"orderLinkId": order_link_id})
+                            orderlinkid_to_limit[account_name][order_link_id] = i
+                            pending_orderlinks[account_name].add(order_link_id)
+                        print(f"[{account_name}] 📌 Limit{i} placed (orderLinkId={order_link_id}) @ {order_dict[f'limit{i}']}")
+                    else:
+                        print(f"[{account_name}] ⚠️ Error placing Limit{i} (manual): {resp}")
                 except Exception as e:
-                    print(f"[{account_name}] ⚠️ Error placing Limit{i}: {e}")
+                    print(f"[{account_name}] ⚠️ Exception placing Limit{i}: {e}")
                 time.sleep(1)
 
         # run placement for all accounts in parallel
@@ -283,22 +356,25 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                     print(f"[{account_name}] ⚠️ Missing TP/SL for limit {limit_num}")
                     continue
 
-                # set trading stop (TP/SL)
+                # set trading stop (TP/SL) via manual signed POST
                 try:
-                    rate_limited_request(account_name, sessions[account_name].set_trading_stop,
-                                         category="linear",
-                                         symbol=tpsl_dict["symbol"],
-                                         takeProfit=str(tp),
-                                         stopLoss=str(sl),
-                                         positionIdx=0)
-                    with lock:
-                        final_summary[account_name]["filled"].append(f"Limit{limit_num}")
-                        # mark that this account now has an active monitored position
-                        active_position_flag[account_name] = True
-                    print(f"[{account_name}] ✅ Limit{limit_num} filled → TP/SL set (tp={tp} sl={sl}).")
-                    # Start a position monitor thread for this account if not already running
-                    t = threading.Thread(target=position_monitor, args=(account_name,), daemon=True)
-                    t.start()
+                    body = {
+                        "category": "linear",
+                        "symbol": tpsl_dict["symbol"],
+                        "takeProfit": str(tp),
+                        "stopLoss": str(sl),
+                        "positionIdx": 0
+                    }
+                    resp = rate_limited_request(account_name, actions[account_name]["set_trading_stop"], body)
+                    if isinstance(resp, dict) and resp.get("retCode") == 0:
+                        with lock:
+                            final_summary[account_name]["filled"].append(f"Limit{limit_num}")
+                            active_position_flag[account_name] = True
+                        print(f"[{account_name}] ✅ Limit{limit_num} filled → TP/SL set (tp={tp} sl={sl}).")
+                        t = threading.Thread(target=position_monitor, args=(account_name,), daemon=True)
+                        t.start()
+                    else:
+                        print(f"[{account_name}] ⚠️ set_trading_stop failed: {resp}")
                 except Exception as e:
                     print(f"[{account_name}] ⚠️ Error setting TP/SL for Limit{limit_num}: {e}")
 
@@ -373,8 +449,6 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                                                 fill_events.put((acc, missing_link))
                                                 print(f"[DEBUG] [{acc}] (history) Order {missing_link} detected as filled (status={status}).")
                                                 break
-                                    else:
-                                        pass
                                 except Exception as e:
                                     print(f"[{acc}] ⚠️ Error checking history for {missing_link}: {e}")
 
@@ -417,18 +491,17 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                         if size == 0:
                             print(f"[{account_name}] ✅ Position closed (TP/SL hit or manual close). Cancelling remaining limit orders...")
                             try:
-                                cancel_fn = getattr(sessions[account_name], "cancel_order", None) or getattr(sessions[account_name], "cancel_active_order", None)
                                 with lock:
                                     to_cancel = list(pending_orderlinks[account_name])
                                 for link in to_cancel:
                                     try:
-                                        if callable(cancel_fn):
-                                            rate_limited_request(account_name, cancel_fn,
-                                                                 category="linear", symbol=tpsl_dict["symbol"], orderLinkId=link)
-                                            with lock:
-                                                final_summary[account_name]["canceled"].append(link)
-                                                pending_orderlinks[account_name].discard(link)
-                                            print(f"[{account_name}] ❌ Cancelled leftover order {link} after position closed.")
+                                        # cancel via manual signed POST (use orderLinkId)
+                                        cancel_body = {"category":"linear","symbol":tpsl_dict["symbol"], "orderLinkId": link}
+                                        resp = rate_limited_request(account_name, actions[account_name]["cancel_order"], cancel_body)
+                                        with lock:
+                                            final_summary[account_name]["canceled"].append(link)
+                                            pending_orderlinks[account_name].discard(link)
+                                        print(f"[{account_name}] ❌ Cancelled leftover order {link} after position closed. resp={resp}")
                                     except Exception as e:
                                         print(f"[{account_name}] ⚠️ Error cancelling {link}: {e}")
                             except Exception as e:
@@ -477,22 +550,20 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                         # perform immediate cancel+close flow and stop everything
                         print(f"[{acc}] ⛔ User requested cancel. Cancelling outstanding orders and closing positions...")
                         try:
-                            cancel_fn = getattr(sessions[acc], "cancel_order", None) or getattr(sessions[acc], "cancel_active_order", None)
                             with lock:
                                 to_cancel = list(results.get(acc, []))
                             for o in to_cancel:
                                 olnk = o.get("orderLinkId")
                                 if not olnk:
                                     continue
-                                if callable(cancel_fn):
-                                    try:
-                                        rate_limited_request(acc, cancel_fn,
-                                                             category="linear", symbol=tpsl_dict["symbol"], orderLinkId=olnk)
-                                        with lock:
-                                            final_summary[acc]["canceled"].append(olnk)
-                                    except Exception as e:
-                                        print(f"[{acc}] ⚠️ Error cancelling {olnk}: {e}")
-                            # close positions
+                                try:
+                                    cancel_body = {"category":"linear","symbol":tpsl_dict["symbol"], "orderLinkId":olnk}
+                                    resp = rate_limited_request(acc, actions[acc]["cancel_order"], cancel_body)
+                                    with lock:
+                                        final_summary[acc]["canceled"].append(olnk)
+                                except Exception as e:
+                                    print(f"[{acc}] ⚠️ Error cancelling {olnk}: {e}")
+                            # close positions (if any) using manual signed POST market close
                             pos_info = rate_limited_request(acc, sessions[acc].get_positions,
                                                             category="linear", symbol=tpsl_dict["symbol"])
                             for p in pos_info.get("result", {}).get("list", []):
@@ -500,14 +571,18 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                                 side = p.get("side")
                                 if size > 0:
                                     close_side = "Sell" if side == "Buy" else "Buy"
-                                    rate_limited_request(acc, sessions[acc].place_order,
-                                                         category="linear",
-                                                         symbol=tpsl_dict["symbol"],
-                                                         side=close_side,
-                                                         orderType="Market",
-                                                         qty=str(size),
-                                                         reduceOnly=True)
-                                    print(f"[{acc}] 🛑 Closed {size} {side} position.")
+                                    close_body = {
+                                        "category":"linear",
+                                        "symbol": tpsl_dict["symbol"],
+                                        "side": close_side,
+                                        "orderType": "Market",
+                                        "qty": str(size),
+                                        "reduceOnly": True,
+                                        "timeInForce":"GTC",
+                                        "orderLinkId": f"close_{acc}_{int(time.time()*1000)}"
+                                    }
+                                    resp = rate_limited_request(acc, actions[acc]["place_order"], close_body)
+                                    print(f"[{acc}] 🛑 Close resp: {resp}")
                         except Exception as e:
                             print(f"[{acc}] ⚠️ Error during cancel sequence: {e}")
                         final_summary[acc]["user_cancel"] = True
@@ -519,21 +594,19 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                     if order_timestamps.get(acc) and now - order_timestamps[acc] > max_wait_seconds:
                         print(f"[{acc}] ⏳ Timeout reached, cancelling remaining orders.")
                         try:
-                            cancel_fn = getattr(sessions[acc], "cancel_order", None) or getattr(sessions[acc], "cancel_active_order", None)
                             with lock:
                                 to_cancel = list(results.get(acc, []))
                             for o in to_cancel:
                                 olnk = o.get("orderLinkId")
                                 if not olnk:
                                     continue
-                                if callable(cancel_fn):
-                                    try:
-                                        rate_limited_request(acc, cancel_fn,
-                                                             category="linear", symbol=tpsl_dict["symbol"], orderLinkId=olnk)
-                                        with lock:
-                                            final_summary[acc]["canceled"].append(olnk)
-                                    except Exception as e:
-                                        print(f"[{acc}] ⚠️ Error cancelling {olnk}: {e}")
+                                try:
+                                    cancel_body = {"category":"linear","symbol":tpsl_dict["symbol"], "orderLinkId":olnk}
+                                    resp = rate_limited_request(acc, actions[acc]["cancel_order"], cancel_body)
+                                    with lock:
+                                        final_summary[acc]["canceled"].append(olnk)
+                                except Exception as e:
+                                    print(f"[{acc}] ⚠️ Error cancelling {olnk}: {e}")
                         except Exception as e:
                             print(f"[{acc}] ⚠️ Error during timeout cancel: {e}")
                         final_summary[acc]["timeout"] = True
