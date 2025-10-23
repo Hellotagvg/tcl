@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""
+Bybit trading helper — time correction via NTP (primary) with Bybit endpoints as fallback.
+
+Requirements:
+  pip install ntplib pybit requests
+"""
+
 import threading
 import time
 import uuid
@@ -8,6 +15,7 @@ import contextlib
 import hmac
 import hashlib
 import json
+import ntplib
 
 from pybit.unified_trading import HTTP
 
@@ -15,7 +23,26 @@ from pybit.unified_trading import HTTP
 # Receive window in milliseconds (10 minutes = 600000)
 RECV_WINDOW_MS = 600000
 
-# ---------- Bybit server-time helper & patch ----------
+# ---------- NTP helper & fallback to Bybit endpoints ----------
+def _fetch_ntp_time_ms(servers=None, timeout=5):
+    """
+    Query NTP servers and return best estimated server time in milliseconds, or None on failure.
+    Tries multiple servers in order until one returns a valid response.
+    """
+    if servers is None:
+        servers = ["pool.ntp.org", "time.google.com", "time.windows.com"]
+    client = ntplib.NTPClient()
+    for s in servers:
+        try:
+            resp = client.request(s, version=3, timeout=timeout)
+            # resp.tx_time is seconds since epoch (float)
+            server_ms = int(resp.tx_time * 1000)
+            return server_ms
+        except Exception:
+            continue
+    return None
+
+
 def _fetch_bybit_server_time_ms(demo=True, timeout=5):
     """Try several Bybit time endpoints and return server_time_ms or None."""
     candidates = []
@@ -54,24 +81,31 @@ def _fetch_bybit_server_time_ms(demo=True, timeout=5):
 
 
 @contextlib.contextmanager
-def use_bybit_server_time_patch(demo=True, verbose=True):
-    """Patch time.time() and time.time_ns() so signatures use Bybit server time.
+def use_ntp_time_patch(verbose=True, ntp_servers=None, demo_fallback=True):
+    """
+    Patch time.time() and time.time_ns() so signatures use NTP time (preferred).
+    If NTP fails and demo_fallback=True, attempt to use Bybit server time as a fallback.
 
     Yields True if patched; False if fetch failed (no patch applied).
     Restores originals on exit.
     """
-    server_ts = _fetch_bybit_server_time_ms(demo=demo)
-    local_ts = int(time.time() * 1000)
+    server_ts = _fetch_ntp_time_ms(servers=ntp_servers)
+    source = "NTP"
+    if server_ts is None and demo_fallback:
+        # fallback to Bybit server time (best-effort)
+        server_ts = _fetch_bybit_server_time_ms(demo=True)
+        source = "Bybit"
     if server_ts is None:
         if verbose:
-            print("[bybit-time] WARNING: could not fetch Bybit server time; not patching time()")
+            print("[time-patch] WARNING: could not fetch NTP or Bybit server time; not patching time()")
         yield False
         return
 
+    local_ts = int(time.time() * 1000)
     offset_ms = server_ts - local_ts
     offset_s = offset_ms / 1000.0
     if verbose:
-        print(f"[bybit-time] server_ms={server_ts}, local_ms={local_ts}, offset_ms={offset_ms}")
+        print(f"[time-patch] source={source} server_ms={server_ts}, local_ms={local_ts}, offset_ms={offset_ms}")
 
     orig_time = time.time
     orig_time_ns = getattr(time, "time_ns", None)
@@ -93,7 +127,7 @@ def use_bybit_server_time_patch(demo=True, verbose=True):
         if orig_time_ns is not None:
             time.time_ns = orig_time_ns
         if verbose:
-            print("[bybit-time] restored original time() and time_ns()")
+            print("[time-patch] restored original time() and time_ns()")
 
 
 # ---------- Rate-limited REST requests (simple per-account 1req/sec) ----------
@@ -225,20 +259,26 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
     demo: True -> use Bybit Demo environment (pass demo=demo to HTTP)
     """
 
-    # quick check: print drift vs server time (best-effort)
-    server_ts = _fetch_bybit_server_time_ms(demo=demo)
+    # quick check: print drift vs NTP time (best-effort)
+    server_ts = _fetch_ntp_time_ms()
     local_ts = int(time.time() * 1000)
     drift = None
     if server_ts is not None:
         drift = local_ts - server_ts
-        print(f"[INFO] Local ms: {local_ts} | Bybit server ms: {server_ts} | drift (local - server) = {drift} ms")
+        print(f"[INFO] Local ms: {local_ts} | NTP server ms: {server_ts} | drift (local - server) = {drift} ms")
         if abs(drift) > RECV_WINDOW_MS:
             print(f"[WARN] Absolute drift ({abs(drift)} ms) exceeds configured recv_window ({RECV_WINDOW_MS} ms).")
     else:
-        print("[INFO] Could not determine Bybit server time before start; will try to patch during run.")
+        # fallback informational check using Bybit endpoints
+        srv = _fetch_bybit_server_time_ms(demo=demo)
+        if srv is not None:
+            drift = local_ts - srv
+            print(f"[INFO] Local ms: {local_ts} | Bybit server ms: {srv} | drift (local - server) = {drift} ms (NTP unavailable)")
+        else:
+            print("[INFO] Could not determine authoritative server time before start; will try to patch during run.")
 
-    # Use Bybit server time for the entire trading run so every signed call uses corrected time.
-    with use_bybit_server_time_patch(demo=demo):
+    # Use NTP (or fallback) server time for the entire trading run so every signed call uses corrected time.
+    with use_ntp_time_patch():
         # State containers
         results = {}   # per-account placed orders list of {"orderLinkId":...}
         sessions = {}  # per-account HTTP (pybit) session
