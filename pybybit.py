@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
 """
-Bybit trading helper — time correction via NTP (primary) with Bybit endpoints as fallback.
+trade_tcl_ntp_safe.py
+
+Bybit trading run helper (NTP-based time patch + re-entrant safe).
+
+Features:
+- Applies NTP-based time offset (preferred) and falls back to Bybit endpoints if needed.
+- Patches time.time() and time.time_ns() for the duration of each run so HMAC timestamps align.
+- Safe to call trade_tcl(...) multiple times inside the same Python process: global runtime
+  state is cleared and all threads/sessions are cleaned up at the end of the run.
+- Treats Bybit retCode 34040 ("not modified") as success for TPSL setting.
+- Keeps debug logging similar to the original script.
 
 Requirements:
-  pip install ntplib pybit requests
+    pip install ntplib requests pybit
+
+Usage:
+    from trade_tcl_ntp_safe import trade_tcl
+    trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True)
+
 """
 
 import threading
@@ -16,28 +31,30 @@ import hmac
 import hashlib
 import json
 import ntplib
+import traceback
+import gc
 
-from pybit.unified_trading import HTTP
+from pybit.unified_trading import HTTP  # your original import
 
 # ---------------------- CONFIG ----------------------
-# Receive window in milliseconds (10 minutes = 600000)
-RECV_WINDOW_MS = 600000
+RECV_WINDOW_MS = 600000  # 10 minutes
+NTP_SERVERS = ["pool.ntp.org", "time.google.com", "time.cloudflare.com"]
 
-# ---------- NTP helper & fallback to Bybit endpoints ----------
+# ---------------------- Global runtime/shared state ----------------------
+# Only a rate-limit map is global; it's cleared at the start of each run
+last_request_time = {}
+_state_lock = threading.RLock()
+
+# ---------------------- Time helpers ----------------------
 def _fetch_ntp_time_ms(servers=None, timeout=5):
-    """
-    Query NTP servers and return best estimated server time in milliseconds, or None on failure.
-    Tries multiple servers in order until one returns a valid response.
-    """
+    """Return time from NTP server in milliseconds, or None on failure."""
     if servers is None:
-        servers = ["pool.ntp.org", "time.google.com", "time.windows.com"]
+        servers = NTP_SERVERS
     client = ntplib.NTPClient()
     for s in servers:
         try:
             resp = client.request(s, version=3, timeout=timeout)
-            # resp.tx_time is seconds since epoch (float)
-            server_ms = int(resp.tx_time * 1000)
-            return server_ms
+            return int(resp.tx_time * 1000)
         except Exception:
             continue
     return None
@@ -83,27 +100,27 @@ def _fetch_bybit_server_time_ms(demo=True, timeout=5):
 @contextlib.contextmanager
 def use_ntp_time_patch(verbose=True, ntp_servers=None, demo_fallback=True):
     """
-    Patch time.time() and time.time_ns() so signatures use NTP time (preferred).
-    If NTP fails and demo_fallback=True, attempt to use Bybit server time as a fallback.
-
-    Yields True if patched; False if fetch failed (no patch applied).
+    Patch time.time() and time.time_ns() so HMAC timestamps use authoritative NTP/Bybit time.
+    Yields True if patched; False if no patch applied.
     Restores originals on exit.
     """
-    server_ts = _fetch_ntp_time_ms(servers=ntp_servers)
+    ntp_ts = _fetch_ntp_time_ms(servers=ntp_servers or NTP_SERVERS)
     source = "NTP"
+    server_ts = ntp_ts
     if server_ts is None and demo_fallback:
-        # fallback to Bybit server time (best-effort)
         server_ts = _fetch_bybit_server_time_ms(demo=True)
         source = "Bybit"
+
     if server_ts is None:
         if verbose:
-            print("[time-patch] WARNING: could not fetch NTP or Bybit server time; not patching time()")
+            print("[time-patch] WARNING: could not fetch NTP/Bybit time; not patching time()")
         yield False
         return
 
     local_ts = int(time.time() * 1000)
     offset_ms = server_ts - local_ts
     offset_s = offset_ms / 1000.0
+
     if verbose:
         print(f"[time-patch] source={source} server_ms={server_ts}, local_ms={local_ts}, offset_ms={offset_ms}")
 
@@ -116,6 +133,7 @@ def use_ntp_time_patch(verbose=True, ntp_servers=None, demo_fallback=True):
     def patched_time_ns():
         return int((orig_time() + offset_s) * 1_000_000_000)
 
+    # Apply patch
     time.time = patched_time
     if orig_time_ns is not None:
         time.time_ns = patched_time_ns
@@ -123,6 +141,7 @@ def use_ntp_time_patch(verbose=True, ntp_servers=None, demo_fallback=True):
     try:
         yield True
     finally:
+        # Restore originals
         time.time = orig_time
         if orig_time_ns is not None:
             time.time_ns = orig_time_ns
@@ -130,21 +149,102 @@ def use_ntp_time_patch(verbose=True, ntp_servers=None, demo_fallback=True):
             print("[time-patch] restored original time() and time_ns()")
 
 
-# ---------- Rate-limited REST requests (simple per-account 1req/sec) ----------
-last_request_time = {}
-
-
+# ---------------------- Rate limiting helper ----------------------
 def rate_limited_request(account_name, func, *args, **kwargs):
-    now = time.time()
-    if account_name in last_request_time:
-        elapsed = now - last_request_time[account_name]
-        if elapsed < 1:
-            time.sleep(1 - elapsed)
-    last_request_time[account_name] = time.time()
+    """
+    Simple per-account 1 request/sec rate limiter.
+    Uses global last_request_time map which is reset at the start of each trade_tcl run.
+    """
+    with _state_lock:
+        now = time.time()
+        last = last_request_time.get(account_name)
+        if last is not None:
+            elapsed = now - last
+            if elapsed < 1:
+                # sleep outside lock in small increments
+                sleep_for = 1 - elapsed
+                # release temporarily to avoid blocking other accounts
+                _state_lock.release()
+                try:
+                    time.sleep(sleep_for)
+                finally:
+                    _state_lock.acquire()
+        last_request_time[account_name] = time.time()
     return func(*args, **kwargs)
 
 
-# ---------- Helper to fetch open orders (tries multiple method names) ----------
+# ---------------------- Signature helper ----------------------
+def _make_signature(api_key, api_secret, recv_window, timestamp_ms, body_json):
+    payload = f"{timestamp_ms}{api_key}{recv_window}{body_json}"
+    return hmac.new(api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def signed_post(base_url, api_key, api_secret, path, body, recv_window_ms=RECV_WINDOW_MS, timeout=10):
+    """
+    Send signed POST to Bybit v5 using patched time() when active.
+    Returns parsed JSON response or dict with http_status/text on non-json.
+    """
+    timestamp = str(int(time.time() * 1000))
+    body_json = json.dumps(body, separators=(",", ":"))
+    sign = _make_signature(api_key, api_secret, str(recv_window_ms), timestamp, body_json)
+
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-SIGN-TYPE": "2",
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": str(recv_window_ms),
+        "Content-Type": "application/json",
+    }
+
+    url = base_url.rstrip("/") + path
+    resp = requests.post(url, headers=headers, data=body_json, timeout=timeout)
+    try:
+        return resp.json()
+    except ValueError:
+        return {"http_status": resp.status_code, "text": resp.text}
+
+
+def make_account_actions(api_key, api_secret, demo=True, recv_window_ms=RECV_WINDOW_MS):
+    """Manual signed POST wrappers per-account (so we don't rely on pybit POST quirks)."""
+    base = "https://api-demo.bybit.com" if demo else "https://api.bybit.com"
+
+    def place_order(body):
+        return signed_post(base, api_key, api_secret, "/v5/order/create", body, recv_window_ms)
+
+    def cancel_order(body):
+        return signed_post(base, api_key, api_secret, "/v5/order/cancel", body, recv_window_ms)
+
+    def set_trading_stop(body):
+        return signed_post(base, api_key, api_secret, "/v5/position/trading-stop", body, recv_window_ms)
+
+    def set_leverage(body):
+        return signed_post(base, api_key, api_secret, "/v5/position/set-leverage", body, recv_window_ms)
+
+    return {
+        "place_order": place_order,
+        "cancel_order": cancel_order,
+        "set_trading_stop": set_trading_stop,
+        "set_leverage": set_leverage,
+        "base_url": base,
+    }
+
+
+# ---------------------- Safe runtime reset ----------------------
+def reset_runtime_state():
+    """Clear global runtime maps and attempt to encourage GC so leftover sessions/threads are freed."""
+    global last_request_time
+    with _state_lock:
+        last_request_time.clear()
+    # Attempt garbage collection - helpful if some objects reference requests sessions
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    print("[DEBUG] reset_runtime_state(): cleared global runtime maps and ran GC.")
+
+
+# ---------------------- Helper to fetch open orders (as before) ----------------------
 def fetch_open_orders_safe(session, symbol):
     """
     Try several common pybit method names to obtain open/active orders.
@@ -178,7 +278,6 @@ def fetch_open_orders_safe(session, symbol):
                         return result["data"]
                 if isinstance(result, list):
                     return result
-                # Some responses may be in resp["data"] directly
                 if "data" in resp and isinstance(resp["data"], list):
                     return resp["data"]
             if isinstance(resp, list):
@@ -191,95 +290,41 @@ def fetch_open_orders_safe(session, symbol):
     raise AttributeError("No supported open-order fetch method found on session")
 
 
-# ---------- Signed POST helper (v5) ----------
-def _make_signature(api_key, api_secret, recv_window, timestamp_ms, body_json):
-    """Bybit v5 sign: HMAC_SHA256(secret, timestamp + apiKey + recvWindow + body_json)"""
-    payload = f"{timestamp_ms}{api_key}{recv_window}{body_json}"
-    return hmac.new(api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def signed_post(base_url, api_key, api_secret, path, body, recv_window_ms=RECV_WINDOW_MS, timeout=10):
-    """
-    Send signed POST to Bybit v5.
-    body: Python dict -> will be JSON-serialized with separators=(',', ':') (no spaces).
-    Returns parsed JSON response.
-    """
-    timestamp = str(int(time.time() * 1000))
-    body_json = json.dumps(body, separators=(",", ":"))
-    sign = _make_signature(api_key, api_secret, str(recv_window_ms), timestamp, body_json)
-
-    headers = {
-        "X-BAPI-API-KEY": api_key,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-SIGN-TYPE": "2",
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": str(recv_window_ms),
-        "Content-Type": "application/json",
-    }
-
-    url = base_url.rstrip("/") + path
-    resp = requests.post(url, headers=headers, data=body_json, timeout=timeout)
-    try:
-        return resp.json()
-    except ValueError:
-        return {"http_status": resp.status_code, "text": resp.text}
-
-
-# Action wrappers (per-account)
-def make_account_actions(api_key, api_secret, demo=True, recv_window_ms=RECV_WINDOW_MS):
-    base = "https://api-demo.bybit.com" if demo else "https://api.bybit.com"
-
-    def place_order(body):
-        return signed_post(base, api_key, api_secret, "/v5/order/create", body, recv_window_ms)
-
-    def cancel_order(body):
-        return signed_post(base, api_key, api_secret, "/v5/order/cancel", body, recv_window_ms)
-
-    def set_trading_stop(body):
-        return signed_post(base, api_key, api_secret, "/v5/position/trading-stop", body, recv_window_ms)
-
-    def set_leverage(body):
-        return signed_post(base, api_key, api_secret, "/v5/position/set-leverage", body, recv_window_ms)
-
-    return {
-        "place_order": place_order,
-        "cancel_order": cancel_order,
-        "set_trading_stop": set_trading_stop,
-        "set_leverage": set_leverage,
-        "base_url": base,
-    }
-
-
-# ---------- Main function ----------
+# ---------------------- Main run (re-entrant) ----------------------
 def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300):
     """
+    Main trading function (safe to call repeatedly in the same interpreter).
+
     keys_dict: {"acc1": {"api_key": "...", "api_secret": "..."}, ...}
     order_dict: {"coin":"BTCUSDT","side":"Buy","leverage":..,"qty1":..,"limit1":..,...}
     tpsl_dict: {"symbol":"BTCUSDT","tp1":..,"sl1":..,...}
-    demo: True -> use Bybit Demo environment (pass demo=demo to HTTP)
+    demo: True -> use Bybit demo endpoints
     """
+    # Reset global runtime state for a clean run
+    reset_runtime_state()
 
-    # quick check: print drift vs NTP time (best-effort)
-    server_ts = _fetch_ntp_time_ms()
-    local_ts = int(time.time() * 1000)
-    drift = None
-    if server_ts is not None:
-        drift = local_ts - server_ts
-        print(f"[INFO] Local ms: {local_ts} | NTP server ms: {server_ts} | drift (local - server) = {drift} ms")
-        if abs(drift) > RECV_WINDOW_MS:
-            print(f"[WARN] Absolute drift ({abs(drift)} ms) exceeds configured recv_window ({RECV_WINDOW_MS} ms).")
-    else:
-        # fallback informational check using Bybit endpoints
-        srv = _fetch_bybit_server_time_ms(demo=demo)
-        if srv is not None:
-            drift = local_ts - srv
-            print(f"[INFO] Local ms: {local_ts} | Bybit server ms: {srv} | drift (local - server) = {drift} ms (NTP unavailable)")
+    # Informational check: NTP vs local drift (best-effort)
+    try:
+        ntp_ts = _fetch_ntp_time_ms()
+        local_ts = int(time.time() * 1000)
+        if ntp_ts is not None:
+            drift = local_ts - ntp_ts
+            print(f"[INFO] Local ms: {local_ts} | NTP ms: {ntp_ts} | drift (local - server) = {drift} ms")
+            if abs(drift) > RECV_WINDOW_MS:
+                print(f"[WARN] Absolute drift ({abs(drift)} ms) exceeds recv_window ({RECV_WINDOW_MS} ms).")
         else:
-            print("[INFO] Could not determine authoritative server time before start; will try to patch during run.")
+            bybit_ts = _fetch_bybit_server_time_ms(demo=demo)
+            if bybit_ts is not None:
+                drift = local_ts - bybit_ts
+                print(f"[INFO] Local ms: {local_ts} | Bybit ms: {bybit_ts} | drift (local - server) = {drift} ms (NTP unavailable)")
+            else:
+                print("[INFO] Could not determine authoritative server time before start.")
+    except Exception:
+        print("[INFO] Time check failed (exception). Continuing.")
 
-    # Use NTP (or fallback) server time for the entire trading run so every signed call uses corrected time.
-    with use_ntp_time_patch():
-        # State containers
+    # Use authoritative time for the duration of the run
+    with use_ntp_time_patch(verbose=True, ntp_servers=NTP_SERVERS, demo_fallback=True):
+        # Per-run local state (guaranteed fresh each call)
         results = {}   # per-account placed orders list of {"orderLinkId":...}
         sessions = {}  # per-account HTTP (pybit) session
         actions = {}   # per-account manual POST actions (place/cancel/set)
@@ -300,7 +345,7 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
         active_position_flag = {acc: False for acc in keys_dict.keys()}
 
         # lock for modifying shared structures safely
-        lock = threading.Lock()
+        lock = threading.RLock()
 
         fill_events = queue.Queue()
 
@@ -313,7 +358,6 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
             except TypeError:
                 session = HTTP(api_key=creds["api_key"], api_secret=creds["api_secret"], testnet=demo, recv_window=RECV_WINDOW_MS)
             sessions[account_name] = session
-            # create manual action wrappers bound to this account
             actions[account_name] = make_account_actions(creds["api_key"], creds["api_secret"], demo=demo, recv_window_ms=RECV_WINDOW_MS)
 
             # set leverage via signed manual POST (pybit's POST had issues)
@@ -345,7 +389,7 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                         "orderLinkId": order_link_id
                     }
                     resp = rate_limited_request(account_name, actions[account_name]["place_order"], body)
-                    # check success
+                    # check success (Bybit v5 typical success is retCode == 0)
                     if isinstance(resp, dict) and resp.get("retCode") == 0:
                         with lock:
                             results[account_name].append({"orderLinkId": order_link_id})
@@ -356,15 +400,16 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                         print(f"[{account_name}] ⚠️ Error placing Limit{i} (manual): {resp}")
                 except Exception as e:
                     print(f"[{account_name}] ⚠️ Exception placing Limit{i}: {e}")
+                # respect 1 req/sec between placement calls (rate_limited_request will throttle but keep small sleep)
                 time.sleep(1)
 
-        # run placement for all accounts in parallel
-        threads = []
+        # run placement for all accounts in parallel (join before continuing)
+        place_threads = []
         for acc, creds in keys_dict.items():
-            t = threading.Thread(target=place_orders, args=(acc, creds), daemon=True)
-            threads.append(t)
+            t = threading.Thread(target=place_orders, args=(acc, creds), name=f"place_{acc}", daemon=False)
+            place_threads.append(t)
             t.start()
-        for t in threads:
+        for t in place_threads:
             t.join()
 
         print("[DEBUG] ✅ All accounts placed orders.")
@@ -406,19 +451,27 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                         "positionIdx": 0
                     }
                     resp = rate_limited_request(account_name, actions[account_name]["set_trading_stop"], body)
-                    if isinstance(resp, dict) and resp.get("retCode") == 0:
+                    code = None
+                    if isinstance(resp, dict):
+                        code = resp.get("retCode")
+                    # Treat normal success (0) and "not modified" (34040) as okay
+                    if code in (0, 34040):
                         with lock:
                             final_summary[account_name]["filled"].append(f"Limit{limit_num}")
                             active_position_flag[account_name] = True
-                        print(f"[{account_name}] ✅ Limit{limit_num} filled → TP/SL set (tp={tp} sl={sl}).")
-                        t = threading.Thread(target=position_monitor, args=(account_name,), daemon=True)
+                        if code == 0:
+                            print(f"[{account_name}] ✅ Limit{limit_num} filled → TP/SL set (tp={tp} sl={sl}).")
+                        else:
+                            print(f"[{account_name}] ⚙️ Limit{limit_num} TP/SL already correct (not modified).")
+                        # Start position monitor for this account if not already running
+                        t = threading.Thread(target=position_monitor, args=(account_name,), name=f"posmon_{account_name}", daemon=False)
                         t.start()
                     else:
                         print(f"[{account_name}] ⚠️ set_trading_stop failed: {resp}")
                 except Exception as e:
                     print(f"[{account_name}] ⚠️ Error setting TP/SL for Limit{limit_num}: {e}")
 
-        # ---------- Polling Worker: detect fills by orderLinkId (quiet) ----------
+        # ---------- Polling Worker: detect fills by orderLinkId ----------
         def polling_worker():
             processed = {acc: set() for acc in keys_dict.keys()}
 
@@ -503,10 +556,6 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
 
         # ---------- Position monitor: waits until position closes, then cancels remaining limits ----------
         def position_monitor(account_name):
-            """
-            Wait until a position appears (size>0) then wait until it is closed (size==0).
-            Once closed, cancel any remaining pending limit orders for the account.
-            """
             waited_for_position = False
             while not stop_event.is_set():
                 if not active_position_flag.get(account_name):
@@ -535,7 +584,6 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                                     to_cancel = list(pending_orderlinks[account_name])
                                 for link in to_cancel:
                                     try:
-                                        # cancel via manual signed POST (use orderLinkId)
                                         cancel_body = {"category":"linear","symbol":tpsl_dict["symbol"], "orderLinkId": link}
                                         resp = rate_limited_request(account_name, actions[account_name]["cancel_order"], cancel_body)
                                         with lock:
@@ -557,26 +605,35 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                         break
                     time.sleep(0.2)
 
-        # Start background threads
-        t_poll = threading.Thread(target=polling_worker, daemon=True)
-        t_poll.start()
+        # ---------- Start background threads ----------
+        threads = []
 
-        t_tpsl = threading.Thread(target=tpsl_worker, daemon=True)
+        t_poll = threading.Thread(target=polling_worker, name="polling_worker", daemon=False)
+        t_poll.start()
+        threads.append(t_poll)
+
+        t_tpsl = threading.Thread(target=tpsl_worker, name="tpsl_worker", daemon=False)
         t_tpsl.start()
+        threads.append(t_tpsl)
 
         # ---------- User cancel listener ----------
         def listen_for_cancel():
             while True:
-                user_input = input().strip().lower()
+                try:
+                    user_input = input().strip().lower()
+                except Exception:
+                    # input might be closed in some contexts
+                    break
                 if user_input == "cancel":
                     cancel_requested["flag"] = True
                     print("[DEBUG] Cancel requested by user.")
                     break
 
-        t_listen = threading.Thread(target=listen_for_cancel, daemon=True)
+        t_listen = threading.Thread(target=listen_for_cancel, name="listen_for_cancel", daemon=False)
         t_listen.start()
+        threads.append(t_listen)
 
-        # ---------- Monitor orders, cancel/timeouts ----------
+        # ---------- Monitor/Controller loop ----------
         try:
             while True:
                 all_done = True
@@ -587,15 +644,11 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                         continue
 
                     if cancel_requested["flag"]:
-                        # perform immediate cancel+close flow and stop everything
                         print(f"[{acc}] ⛔ User requested cancel. Cancelling outstanding orders and closing positions...")
                         try:
                             with lock:
-                                to_cancel = list(results.get(acc, []))
-                            for o in to_cancel:
-                                olnk = o.get("orderLinkId")
-                                if not olnk:
-                                    continue
+                                to_cancel = [o.get("orderLinkId") for o in results.get(acc, []) if o.get("orderLinkId")]
+                            for olnk in to_cancel:
                                 try:
                                     cancel_body = {"category":"linear","symbol":tpsl_dict["symbol"], "orderLinkId":olnk}
                                     resp = rate_limited_request(acc, actions[acc]["cancel_order"], cancel_body)
@@ -630,16 +683,13 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                         stop_event.set()
                         continue
 
-                    # timeout handling
+                    # timeout handling (per-account)
                     if order_timestamps.get(acc) and now - order_timestamps[acc] > max_wait_seconds:
                         print(f"[{acc}] ⏳ Timeout reached, cancelling remaining orders.")
                         try:
                             with lock:
-                                to_cancel = list(results.get(acc, []))
-                            for o in to_cancel:
-                                olnk = o.get("orderLinkId")
-                                if not olnk:
-                                    continue
+                                to_cancel = [o.get("orderLinkId") for o in results.get(acc, []) if o.get("orderLinkId")]
+                            for olnk in to_cancel:
                                 try:
                                     cancel_body = {"category":"linear","symbol":tpsl_dict["symbol"], "orderLinkId":olnk}
                                     resp = rate_limited_request(acc, actions[acc]["cancel_order"], cancel_body)
@@ -657,7 +707,6 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                     if pending_orderlinks[acc] or active_position_flag[acc]:
                         all_done = False
                     else:
-                        # nothing pending and no active position => done
                         final_summary[acc]["done"] = True
 
                 if all_done:
@@ -673,13 +722,46 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
         except KeyboardInterrupt:
             print("[DEBUG] KeyboardInterrupt received, stopping.")
             stop_event.set()
+        except Exception as e:
+            print("[DEBUG] Unexpected exception in controller loop:", e)
+            traceback.print_exc()
+            stop_event.set()
 
-        # wait briefly for threads to exit
-        t_poll.join(timeout=2)
-        t_tpsl.join(timeout=2)
-        t_listen.join(timeout=0.1)
+        # ------- Clean up threads and sessions -------
+        # Wait for threads to exit (with timeout). Threads created locally are non-daemon so they should exit quickly.
+        for t in threads:
+            if t.is_alive():
+                try:
+                    t.join(timeout=2)
+                except Exception:
+                    pass
 
-    # after exiting the 'with' block, time() restored
+        # Also join any position monitor threads (they were created dynamically)
+        # We attempt to be defensive: iterate over threading.enumerate() and join any named posmon_* or place_* threads
+        for t in threading.enumerate():
+            if t.name.startswith(("posmon_", "place_")) and t is not threading.current_thread():
+                try:
+                    t.join(timeout=1)
+                except Exception:
+                    pass
+
+        # Close sessions if possible
+        for acc, s in list(sessions.items()):
+            try:
+                # pybit HTTP wrapper may hold a requests.Session in attribute 'session' or 'http'
+                sess_obj = getattr(s, "session", None) or getattr(s, "http", None)
+                if hasattr(sess_obj, "close"):
+                    sess_obj.close()
+            except Exception:
+                pass
+
+        # final garbage collect
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+    # after exiting 'with', restored original time()
     print("[DEBUG] Exiting trade_tcl, summary:")
-    print(final_summary)
+    print(json.dumps(final_summary, indent=2))
     return final_summary
